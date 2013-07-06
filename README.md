@@ -1,4 +1,3 @@
-nanchenzi.github.io
+2375.me
 ===================
-
-南臣子  2375.me
+南臣子 Blogging Like a Hacker
