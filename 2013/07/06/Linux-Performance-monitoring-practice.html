@@ -97,7 +97,137 @@
 
 <p>buffers和cached的大小你可以通过开多个虚拟机发现越变越小,当你立即释放虚拟机占据的内存后,buffers和cached的大小是伴着系统后续文件的使用逐渐增大的,猜想:buffers和cached内存占用的大小应该直接影响系统的性能,这部分内存占用越小系统的性能越低?</p>
 
-<p>&#8230;未完待续</p>
+<h3 id='io_iostat'>I/O iostat</h3>
+
+<p>iostat是用来监测硬盘的读写速率,也就是IOPS.iostat report了三个方面的信息{cpu,device I/O,network},其中cpu和network的相关信息是和I/O操作相关的.iostat的report的原数据主要来自/proc/diskstats.先来看一下cpu方面的report信息</p>
+<div class='highlight'><pre><code class='ruby'><span class='no'>Linux</span> <span class='mi'>2</span><span class='o'>.</span><span class='mi'>6</span><span class='o'>.</span><span class='mi'>32</span><span class='o'>-</span><span class='mi'>279</span><span class='o'>.</span><span class='n'>el6</span><span class='o'>.</span><span class='n'>x86</span> <span class='n'>_</span> <span class='mi'>64</span> <span class='p'>(</span><span class='n'>hostname</span><span class='p'>)</span> 	<span class='mo'>07</span><span class='o'>/</span><span class='mi'>31</span><span class='o'>/</span><span class='mi'>2013</span> 	<span class='n'>_x86_64</span> <span class='p'>(</span><span class='mi'>24</span> <span class='no'>CPU</span><span class='p'>)</span>
+
+<span class='n'>avg</span><span class='o'>-</span><span class='ss'>cpu</span><span class='p'>:</span>  <span class='o'>%</span><span class='n'>user</span>   <span class='o'>%</span><span class='n'>nice</span> <span class='o'>%</span><span class='nb'>system</span> <span class='o'>%</span><span class='n'>iowait</span>  <span class='o'>%</span><span class='n'>steal</span>   <span class='o'>%</span><span class='n'>idle</span>
+           <span class='mi'>2</span><span class='o'>.</span><span class='mi'>61</span>    <span class='mi'>0</span><span class='o'>.</span><span class='mo'>00</span>    <span class='mi'>1</span><span class='o'>.</span><span class='mi'>23</span>    <span class='mi'>0</span><span class='o'>.</span><span class='mi'>42</span>    <span class='mi'>0</span><span class='o'>.</span><span class='mo'>00</span>   <span class='mi'>95</span><span class='o'>.</span><span class='mi'>75</span>
+</code></pre></div>
+<ul>
+<li>
+<p>%user 用户级别的cpu占用率,就是应用的占用率</p>
+</li>
+
+<li>
+<p>%nice 用户级别的并且开始执行应用时指定了nice的优先级(priority)的cpu占用率</p>
+</li>
+
+<li>
+<p>%system 当然是系统级别的kernel的cpu占用率</p>
+</li>
+
+<li>
+<p>%iowait 硬盘的I/O很容易成为系统的瓶颈,此项目就显示了cpu在等待I/O操作所占的比重,我们当然希望这个值越低系统运行的越健康</p>
+</li>
+
+<li>
+<p>%steal 虚拟化的cpu等待的处理器服务于其他虚拟的cpu的时间.例如,虚拟的两个cpu Va和Vb, steal就是Va等待处理器被Vb占用的执行指令的时间.</p>
+</li>
+
+<li>
+<p>%idle 在没有磁盘I/O操作状态下CPU空闲的占用率信息</p>
+</li>
+</ul>
+
+<p>再来看一下iostat的主要作用监控磁盘设备的状态</p>
+
+<ul>
+<li>
+<p>tps 表示一秒钟内设备的传输次数,一次传输指的是一次设备上的I/O请求,多个逻辑上的I/O请求合并为一次I/O请求,一次I/O请求传输的大小不确定.</p>
+</li>
+
+<li>
+<p>Blk_read/s(kB_read/s, MB_read/s) 每秒钟从设备读取的块的数量(kB或者MB),KB块的大小为扇区的大小,即512k</p>
+</li>
+
+<li>
+<p>Blk_wrtn/s (kB_wrtn/s, MB_wrtn/s)每秒钟写入到设备的块的数量</p>
+</li>
+
+<li>
+<p>Blk_read(kB_read, MB_read) 读取块的总数</p>
+</li>
+
+<li>
+<p>Blk_wrtn(kB_wrtn, MB_wrtn) 写入块的总数</p>
+</li>
+
+<li>
+<p>rrqm/s 对于写队列中对相同的block的读取fileSystem会合并为一个读请求,rrqm/s表示的就是合并的个数</p>
+</li>
+
+<li>
+<p>wrqm/s 对于相同块的写入合并为一次写操作,wrqm/s表示的就是合并的写个数</p>
+</li>
+
+<li>
+<p>r/s 每秒完成的读操作次数(合并后的读操作)</p>
+</li>
+
+<li>
+<p>w/s 每秒完成的写操作的次数(也是合并后的操作)</p>
+</li>
+
+<li>
+<p>rsec/s (rkB/s, rMB/s) 每秒读的扇区的数量</p>
+</li>
+
+<li>
+<p>wsec/s (wkB/s, wMB/s) 每秒写的扇区的数量</p>
+</li>
+
+<li>
+<p>avgrq-sz 每秒I/O设备平均的请求次数</p>
+</li>
+
+<li>
+<p>avgqu-sz 每秒I/O设备的平均请求队列长度</p>
+</li>
+
+<li>
+<p>await 每毫秒秒平均的请求等待和服务时间.包括请求到队列中,和I/O设备完成请求服务的时间</p>
+</li>
+
+<li>
+<p>r _ await 毫秒级的读请求的等待和服务时间</p>
+</li>
+
+<li>
+<p>w _ await 毫秒级的写请求的等待和服务时间</p>
+</li>
+
+<li>
+<p>svctm 毫秒级的平均服务时间I(将要被移除,man文档的描述是不推荐的参考值)</p>
+</li>
+
+<li>
+<p>%util I/O操作占用CPU的百分率,当I/O操作过于繁忙的时候值会达到100%</p>
+</li>
+</ul>
+
+<p>至于网络的话就不写了.太多了&gt;.&lt;</p>
+
+<p>命令行参数的使用:</p>
+
+<p>* -c 仅打印CPU的report</p>
+
+<p>* -d 打印I/O设备的report</p>
+
+<p>* -h report输出格式化</p>
+
+<p>* -k 输出的大小单位为kilobytes</p>
+
+<p>* -m 输出的大小单位为megabytes</p>
+
+<p>* -p 输出一个指定I/O设备的report,输出的结果中还包行这个设备下的所有分区表的分别的repor的统计信息 ex: iostat -dx -p sda 2 6 指定输出sda这个设备下的扩展的统计信息,每两秒输出一次,一共输出6次</p>
+
+<p>* -t 指定report的统计的间隔时间(可忽略直接上数字)</p>
+
+<p>* -V 打印iostat的版本号</p>
+
+<p>* -x 显示扩展的统计项.默认的显示是从{tps-Blk_wrtn},而扩展项是从{rrqm/s-util} 用法iostat -x sda</p>
 
 <p>参考书籍</p>
 
