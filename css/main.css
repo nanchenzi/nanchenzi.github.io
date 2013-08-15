@@ -14,10 +14,10 @@ html, body { height: 100%; }
 
 body {
   background-color: #FFF;
-  font: 10.34px Helvetica, Arial, sans-serif;
+  font: 13.34px Helvetica, Arial, sans-serif;
   font-size: small;
   text-align: center;
-  letter-spacing: 1em;
+  letter-spacing: 5px;
 }
 
 h1, h2, h3, h4, h5, h6 {
