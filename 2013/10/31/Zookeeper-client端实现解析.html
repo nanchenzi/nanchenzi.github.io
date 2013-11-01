@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+        <title>Blogging Like a Hacker</title>
+        <meta name="viewport" content="width=device-width">
+
+        <!-- syntax highlighting CSS -->
+        <link rel="stylesheet" href="/css/syntax.css">
+
+        <!-- Custom CSS -->
+        <link rel="stylesheet" href="/css/main.css">
+
+    </head>
+    <body>
+
+        <div class="container">
+          <div class="site">
+            <div class="header">
+              <h1 class="title"><a href="/">南臣子</a></h1>
+            </div>
+
+                <h2>Blogging Like a Hacker</h2>
+<p class="meta">31 Oct 2013</p>
+
+<div class="post">
+<p>zookeeper 客户端的实现主要由以下三个类完成:</p>
+
+<ul>
+<li>org.apache.zookeeper.ZooKeeper</li>
+
+<li>org.apache.zookeeper.ClientCnxn</li>
+
+<li>org.apache.zookeeper.ClientCnxnSocketNIO</li>
+</ul>
+
+<p>org.apache.zookeeper.ZooKeeper主要是一层api的封装,客户端程序用到一个Zookeeper实例就可以进行所有的操作</p>
+
+<p>ZKWatchManager是在org.apache.zookeeper.ZooKeeper下的内部类,包含三个私有属性dataWatches、existWatches、childWatches, ZKWatchManager主要负责管理所有ClientCnxn从server集群上得到Watch事件</p>
+
+<p>ClientCnxn是client端的核心实现,其中包含了两个轮寻的线程SendThread和EventThread,SendThread主要轮循从outgoingQueue队列中取得Zookeeper塞入的Packet包,通过ClientCnxnSocketNIO发送给服务器,并把发送的packet塞入pendingQueue队列中等待服务端的response,同时也从同服务端建立的管道中读取response把相应的packet移出pendingQueue,放入EventThrad负责处理的waitingEvents队列中,SendThread也负责和集群连接的建立、断开和session的ping连接,EventThread负责处理waitingEvent队列中packet,把packet中finished标识为true，使得阻塞的客户端函数返回并且取得packet中的response,根据不同的response调用不同的回调实现方法处理事件，其中waitingEvent队列采用LinkedBlockingQueue</p>
+
+<p>ClientCnxnSocketNIO则是负责网络的通信，管道连接的建立，选择器的select操作,read和write的管道读写操作</p>
+<p><iframe frameborder='0' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;' src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' name='embed_dom'>&nbsp;</iframe></p>
+<h3 id='id1'>连接的建立</h3>
+
+<p>参考org.apache.zookeeper.ZooKeeperMain中的main函数作为入口跟踪连接的建立</p>
+<div class='highlight'><pre><code class='java'> <span class='c1'>//ZooKeeper的构造函数</span>
+ <span class='kd'>public</span> <span class='nf'>ZooKeeper</span><span class='o'>(</span><span class='n'>String</span> <span class='n'>connectString</span><span class='o'>,</span> <span class='kt'>int</span> <span class='n'>sessionTimeout</span><span class='o'>,</span> <span class='n'>Watcher</span> <span class='n'>watcher</span><span class='o'>,</span>
+            <span class='kt'>boolean</span> <span class='n'>canBeReadOnly</span><span class='o'>)</span>
+        <span class='kd'>throws</span> <span class='n'>IOException</span>
+    <span class='o'>{</span>
+
+        <span class='n'>watchManager</span><span class='o'>.</span><span class='na'>defaultWatcher</span> <span class='o'>=</span> <span class='n'>watcher</span><span class='o'>;</span>  <span class='c1'>//默认的实现了process方法的watch</span>
+
+        <span class='n'>ConnectStringParser</span> <span class='n'>connectStringParser</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>ConnectStringParser</span><span class='o'>(</span>
+                <span class='n'>connectString</span><span class='o'>);</span>  <span class='c1'>//解析传入的hostsStr,用于指定chrootPath和生成多个InetSocketAddress集合</span>
+        <span class='n'>HostProvider</span> <span class='n'>hostProvider</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>StaticHostProvider</span><span class='o'>(</span>
+                <span class='n'>connectStringParser</span><span class='o'>.</span><span class='na'>getServerAddresses</span><span class='o'>());</span>  <span class='c1'>//提供InetSocketAddress的工具类</span>
+                                                            <span class='c1'>//其中的Collections.shuffle(this.serverAddresses)</span>
+                                                            <span class='c1'>//保证客户端请求集群中不同的机器，避免羊群效应</span>
+        <span class='n'>cnxn</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>ClientCnxn</span><span class='o'>(</span><span class='n'>connectStringParser</span><span class='o'>.</span><span class='na'>getChrootPath</span><span class='o'>(),</span>
+                <span class='n'>hostProvider</span><span class='o'>,</span> <span class='n'>sessionTimeout</span><span class='o'>,</span> <span class='k'>this</span><span class='o'>,</span> <span class='n'>watchManager</span><span class='o'>,</span>
+                <span class='n'>getClientCnxnSocket</span><span class='o'>(),</span> <span class='n'>canBeReadOnly</span><span class='o'>);</span>
+	<span class='n'>cnxn</span><span class='o'>.</span><span class='na'>start</span><span class='o'>();</span> <span class='c1'>//启动线程sendThread和eventThread</span>
+    <span class='o'>}</span>
+  
+   <span class='c1'>//ClinetCnxn的构造函数</span>
+    <span class='kd'>public</span> <span class='nf'>ClientCnxn</span><span class='o'>(</span><span class='n'>String</span> <span class='n'>chrootPath</span><span class='o'>,</span> <span class='n'>HostProvider</span> <span class='n'>hostProvider</span><span class='o'>,</span> <span class='kt'>int</span> <span class='n'>sessionTimeout</span><span class='o'>,</span> <span class='n'>ZooKeeper</span> <span class='n'>zooKeeper</span><span class='o'>,</span>
+            <span class='n'>ClientWatchManager</span> <span class='n'>watcher</span><span class='o'>,</span> <span class='n'>ClientCnxnSocket</span> <span class='n'>clientCnxnSocket</span><span class='o'>,</span>
+            <span class='kt'>long</span> <span class='n'>sessionId</span><span class='o'>,</span> <span class='kt'>byte</span><span class='o'>[]</span> <span class='n'>sessionPasswd</span><span class='o'>,</span> <span class='kt'>boolean</span> <span class='n'>canBeReadOnly</span><span class='o'>)</span> <span class='o'>{</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>zooKeeper</span> <span class='o'>=</span> <span class='n'>zooKeeper</span><span class='o'>;</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>watcher</span> <span class='o'>=</span> <span class='n'>watcher</span><span class='o'>;</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>sessionId</span> <span class='o'>=</span> <span class='n'>sessionId</span><span class='o'>;</span>  <span class='c1'>//初始为0 </span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>sessionPasswd</span> <span class='o'>=</span> <span class='n'>sessionPasswd</span><span class='o'>;</span> <span class='c1'>//初始为new byte[16]</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>sessionTimeout</span> <span class='o'>=</span> <span class='n'>sessionTimeout</span><span class='o'>;</span> <span class='c1'>//设置为3000ms</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>hostProvider</span> <span class='o'>=</span> <span class='n'>hostProvider</span><span class='o'>;</span>
+        <span class='k'>this</span><span class='o'>.</span><span class='na'>chrootPath</span> <span class='o'>=</span> <span class='n'>chrootPath</span><span class='o'>;</span>
+
+        <span class='n'>connectTimeout</span> <span class='o'>=</span> <span class='n'>sessionTimeout</span> <span class='o'>/</span> <span class='n'>hostProvider</span><span class='o'>.</span><span class='na'>size</span><span class='o'>();</span>  <span class='c1'>//连接的timeout设置为sessionTimeOut除以InetSockAddress集合大小</span>
+                                                                <span class='c1'>//size越大，连接timeout的值越小</span>
+        <span class='n'>readTimeout</span> <span class='o'>=</span> <span class='n'>sessionTimeout</span> <span class='o'>*</span> <span class='mi'>2</span> <span class='o'>/</span> <span class='mi'>3</span><span class='o'>;</span>     <span class='c1'>//读的timeout设为sessionTimeout的三分之二</span>
+        <span class='n'>readOnly</span> <span class='o'>=</span> <span class='n'>canBeReadOnly</span><span class='o'>;</span>
+
+        <span class='n'>sendThread</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>SendThread</span><span class='o'>(</span><span class='n'>clientCnxnSocket</span><span class='o'>);</span>
+        <span class='n'>eventThread</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>EventThread</span><span class='o'>();</span>
+
+    <span class='o'>}</span>   
+</code></pre></div>
+<p>在sendThread中States属性用于标识客户端与集群的连接状态,初始为NOT-CONNECTED,在线程的run方法中创建SocketChanel,并向服务端发送connect的请求消息，在read到服务端的response消息后将state修改为CONNECTED或者CONNECTEDREADONLY</p>
+<div class='highlight'><pre><code class='java'>                   <span class='c1'>//sendThread轮循的代码</span>
+                    <span class='k'>if</span> <span class='o'>(!</span><span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>isConnected</span><span class='o'>())</span> <span class='o'>{</span>  <span class='c1'>//判断ClinetCnxnSocketNIO实现类中的管道选择建是否创建，第一次运行为空进入函数</span>
+                        <span class='k'>if</span><span class='o'>(!</span><span class='n'>isFirstConnect</span><span class='o'>){</span> <span class='c1'>//如果不是第一建立连接则休眠一定的时间</span>
+                            <span class='k'>try</span> <span class='o'>{</span>
+                                <span class='n'>Thread</span><span class='o'>.</span><span class='na'>sleep</span><span class='o'>(</span><span class='n'>r</span><span class='o'>.</span><span class='na'>nextInt</span><span class='o'>(</span><span class='mi'>1000</span><span class='o'>));</span>
+                            <span class='o'>}</span> <span class='k'>catch</span> <span class='o'>(</span><span class='n'>InterruptedException</span> <span class='n'>e</span><span class='o'>)</span> <span class='o'>{</span>
+                                <span class='n'>LOG</span><span class='o'>.</span><span class='na'>warn</span><span class='o'>(</span><span class='s'>&quot;Unexpected exception&quot;</span><span class='o'>,</span> <span class='n'>e</span><span class='o'>);</span>
+                            <span class='o'>}</span>
+                        <span class='o'>}</span>
+                        <span class='c1'>// don&#39;t re-establish connection if we are closing</span>
+                        <span class='k'>if</span> <span class='o'>(</span><span class='n'>closing</span> <span class='o'>||</span> <span class='o'>!</span><span class='n'>state</span><span class='o'>.</span><span class='na'>isAlive</span><span class='o'>())</span> <span class='o'>{</span>
+                            <span class='k'>break</span><span class='o'>;</span>
+                        <span class='o'>}</span>
+                        <span class='n'>startConnect</span><span class='o'>();</span> <span class='c1'>//将state置为CONNECTING,表示连接进行中，并且通过hostProvider提供的InetSockAddress建立管道</span>
+                                        <span class='c1'>//向selector中注册关心OP_CONNECT的管道</span>
+                        <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>updateLastSendAndHeard</span><span class='o'>();</span> <span class='c1'>//更新客户端发送和接收的时间搓</span>
+                    <span class='o'>}</span>
+
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>state</span><span class='o'>.</span><span class='na'>isConnected</span><span class='o'>())</span> <span class='o'>{</span>
+                        <span class='c1'>//...省略了zooKeeperSaslClient的部分代码</span>
+			<span class='n'>to</span> <span class='o'>=</span> <span class='n'>readTimeout</span> <span class='o'>-</span> <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>getIdleRecv</span><span class='o'>();</span> <span class='c1'>//IdleRecv表示上次收到消息和now的间隔</span>
+                    <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+                        <span class='n'>to</span> <span class='o'>=</span> <span class='n'>connectTimeout</span> <span class='o'>-</span> <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>getIdleRecv</span><span class='o'>();</span>
+                    <span class='o'>}</span>
+                    
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>to</span> <span class='o'>&lt;=</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>  <span class='c1'>//小于0表示间隔大于timeout则session失效，抛出异常重新进行连接</span>
+                        <span class='k'>throw</span> <span class='k'>new</span> <span class='nf'>SessionTimeoutException</span><span class='o'>(</span>
+                                <span class='s'>&quot;Client session timed out, have not heard from server in &quot;</span>
+                                        <span class='o'>+</span> <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>getIdleRecv</span><span class='o'>()</span> <span class='o'>+</span> <span class='s'>&quot;ms&quot;</span>
+                                        <span class='o'>+</span> <span class='s'>&quot; for sessionid 0x&quot;</span>
+                                        <span class='o'>+</span> <span class='n'>Long</span><span class='o'>.</span><span class='na'>toHexString</span><span class='o'>(</span><span class='n'>sessionId</span><span class='o'>));</span>
+                    <span class='o'>}</span>
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>state</span><span class='o'>.</span><span class='na'>isConnected</span><span class='o'>())</span> <span class='o'>{</span>
+                        <span class='kt'>int</span> <span class='n'>timeToNextPing</span> <span class='o'>=</span> <span class='n'>readTimeout</span> <span class='o'>/</span> <span class='mi'>2</span>
+                                <span class='o'>-</span> <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>getIdleSend</span><span class='o'>();</span>  <span class='c1'>//在连接已经建立的条件下是否需要发送ping消息保持session</span>
+                        <span class='k'>if</span> <span class='o'>(</span><span class='n'>timeToNextPing</span> <span class='o'>&lt;=</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                            <span class='n'>sendPing</span><span class='o'>();</span>
+                            <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>updateLastSend</span><span class='o'>();</span>
+                        <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+                            <span class='k'>if</span> <span class='o'>(</span><span class='n'>timeToNextPing</span> <span class='o'>&lt;</span> <span class='n'>to</span><span class='o'>)</span> <span class='o'>{</span>
+                                <span class='n'>to</span> <span class='o'>=</span> <span class='n'>timeToNextPing</span><span class='o'>;</span>
+                            <span class='o'>}</span>
+                        <span class='o'>}</span>
+                    <span class='o'>}</span>
+
+                    <span class='c1'>// If we are in read-only mode, seek for read/write server</span>
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>state</span> <span class='o'>==</span> <span class='n'>States</span><span class='o'>.</span><span class='na'>CONNECTEDREADONLY</span><span class='o'>)</span> <span class='o'>{</span> 
+                        <span class='kt'>long</span> <span class='n'>now</span> <span class='o'>=</span> <span class='n'>System</span><span class='o'>.</span><span class='na'>currentTimeMillis</span><span class='o'>();</span>
+                        <span class='kt'>int</span> <span class='n'>idlePingRwServer</span> <span class='o'>=</span> <span class='o'>(</span><span class='kt'>int</span><span class='o'>)</span> <span class='o'>(</span><span class='n'>now</span> <span class='o'>-</span> <span class='n'>lastPingRwServer</span><span class='o'>);</span>
+                        <span class='k'>if</span> <span class='o'>(</span><span class='n'>idlePingRwServer</span> <span class='o'>&gt;=</span> <span class='n'>pingRwTimeout</span><span class='o'>)</span> <span class='o'>{</span>
+                            <span class='n'>lastPingRwServer</span> <span class='o'>=</span> <span class='n'>now</span><span class='o'>;</span>
+                            <span class='n'>idlePingRwServer</span> <span class='o'>=</span> <span class='mi'>0</span><span class='o'>;</span>
+                            <span class='n'>pingRwTimeout</span> <span class='o'>=</span>
+                                <span class='n'>Math</span><span class='o'>.</span><span class='na'>min</span><span class='o'>(</span><span class='mi'>2</span><span class='o'>*</span><span class='n'>pingRwTimeout</span><span class='o'>,</span> <span class='n'>maxPingRwTimeout</span><span class='o'>);</span>
+                            <span class='n'>pingRwServer</span><span class='o'>();</span> <span class='c1'>//由hostProvider得到集群中的另一个InetSockAddress直接建立sock得到outputStream发送‘isro’</span>
+                                           <span class='c1'>//判断该地址是否是rw的服务器,在是的情况下抛出异常重新连接该地址rwServerAddress</span>
+                        <span class='o'>}</span>
+                        <span class='n'>to</span> <span class='o'>=</span> <span class='n'>Math</span><span class='o'>.</span><span class='na'>min</span><span class='o'>(</span><span class='n'>to</span><span class='o'>,</span> <span class='n'>pingRwTimeout</span> <span class='o'>-</span> <span class='n'>idlePingRwServer</span><span class='o'>);</span>
+                    <span class='o'>}</span>
+            <span class='n'>clientCnxnSocket</span><span class='o'>.</span><span class='na'>doTransport</span><span class='o'>(</span><span class='n'>to</span><span class='o'>,</span> <span class='n'>pendingQueue</span><span class='o'>,</span> <span class='n'>outgoingQueue</span><span class='o'>,</span> <span class='n'>ClientCnxn</span><span class='o'>.</span><span class='na'>this</span><span class='o'>);</span><span class='c1'>//调用clientCnxnSocketNIO发送消息</span>
+                
+</code></pre></div>
+<p>clientCnxnSocketNIO中的doTransport主要完成选择建的select()操作获得准备好的通道进行相应的操作，doIo则负责通道的读和写,这也是完成网络通信的主要方法</p>
+<div class='highlight'><pre><code class='java'>  
+ <span class='kt'>void</span> <span class='nf'>doTransport</span><span class='o'>(</span><span class='kt'>int</span> <span class='n'>waitTimeOut</span><span class='o'>,</span> <span class='n'>List</span><span class='o'>&lt;</span><span class='n'>Packet</span><span class='o'>&gt;</span> <span class='n'>pendingQueue</span><span class='o'>,</span> <span class='n'>LinkedList</span><span class='o'>&lt;</span><span class='n'>Packet</span><span class='o'>&gt;</span> <span class='n'>outgoingQueue</span><span class='o'>,</span>
+                     <span class='n'>ClientCnxn</span> <span class='n'>cnxn</span><span class='o'>)</span>
+            <span class='kd'>throws</span> <span class='n'>IOException</span><span class='o'>,</span> <span class='n'>InterruptedException</span> <span class='o'>{</span>
+        <span class='n'>selector</span><span class='o'>.</span><span class='na'>select</span><span class='o'>(</span><span class='n'>waitTimeOut</span><span class='o'>);</span> <span class='c1'>//阻塞的等待相应的时间</span>
+        <span class='n'>Set</span><span class='o'>&lt;</span><span class='n'>SelectionKey</span><span class='o'>&gt;</span> <span class='n'>selected</span><span class='o'>;</span>
+        <span class='kd'>synchronized</span> <span class='o'>(</span><span class='k'>this</span><span class='o'>)</span> <span class='o'>{</span>
+            <span class='n'>selected</span> <span class='o'>=</span> <span class='n'>selector</span><span class='o'>.</span><span class='na'>selectedKeys</span><span class='o'>();</span>  <span class='c1'>//获得准备好的SelectionKey集合</span>
+        <span class='o'>}</span>
+        <span class='c1'>// Everything below and until we get back to the select is</span>
+        <span class='c1'>// non blocking, so time is effectively a constant. That is</span>
+        <span class='c1'>// Why we just have to do this once, here</span>
+        <span class='n'>updateNow</span><span class='o'>();</span>  <span class='c1'>//之所以在这更新now的时间是因为之前的所有操作都是非阻塞的</span>
+        <span class='k'>for</span> <span class='o'>(</span><span class='n'>SelectionKey</span> <span class='n'>k</span> <span class='o'>:</span> <span class='n'>selected</span><span class='o'>)</span> <span class='o'>{</span>
+            <span class='n'>SocketChannel</span> <span class='n'>sc</span> <span class='o'>=</span> <span class='o'>((</span><span class='n'>SocketChannel</span><span class='o'>)</span> <span class='n'>k</span><span class='o'>.</span><span class='na'>channel</span><span class='o'>());</span>
+            <span class='k'>if</span> <span class='o'>((</span><span class='n'>k</span><span class='o'>.</span><span class='na'>readyOps</span><span class='o'>()</span> <span class='o'>&amp;</span> <span class='n'>SelectionKey</span><span class='o'>.</span><span class='na'>OP_CONNECT</span><span class='o'>)</span> <span class='o'>!=</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span> <span class='c1'>//第一次连接时设置的key仅关心连接</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>sc</span><span class='o'>.</span><span class='na'>finishConnect</span><span class='o'>())</span> <span class='o'>{</span>
+                    <span class='n'>updateLastSendAndHeard</span><span class='o'>();</span>
+                    <span class='n'>sendThread</span><span class='o'>.</span><span class='na'>primeConnection</span><span class='o'>();</span>  <span class='c1'>//添加conReq的Packet到outgoingQueue队列中等待下次发送</span>
+						 <span class='c1'>//并且enableReadWriteOnly,等待sendThread下一次调用doTransport,进而进入下面的doIO方法的调用</span>
+                <span class='o'>}</span>
+            <span class='o'>}</span> <span class='k'>else</span> <span class='k'>if</span> <span class='o'>((</span><span class='n'>k</span><span class='o'>.</span><span class='na'>readyOps</span><span class='o'>()</span> <span class='o'>&amp;</span> <span class='o'>(</span><span class='n'>SelectionKey</span><span class='o'>.</span><span class='na'>OP_READ</span> <span class='o'>|</span> <span class='n'>SelectionKey</span><span class='o'>.</span><span class='na'>OP_WRITE</span><span class='o'>))</span> <span class='o'>!=</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='n'>doIO</span><span class='o'>(</span><span class='n'>pendingQueue</span><span class='o'>,</span> <span class='n'>outgoingQueue</span><span class='o'>,</span> <span class='n'>cnxn</span><span class='o'>);</span> <span class='c1'>//调用doIo发送或者读取消息</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>sendThread</span><span class='o'>.</span><span class='na'>getZkState</span><span class='o'>().</span><span class='na'>isConnected</span><span class='o'>())</span> <span class='o'>{</span> <span class='c1'>//在连接的条件下保证outgoingQueue有数据时enableWrite</span>
+            <span class='kd'>synchronized</span><span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>findSendablePacket</span><span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>,</span>
+                        <span class='n'>cnxn</span><span class='o'>.</span><span class='na'>sendThread</span><span class='o'>.</span><span class='na'>clientTunneledAuthenticationInProgress</span><span class='o'>())</span> <span class='o'>!=</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='n'>enableWrite</span><span class='o'>();</span>
+                <span class='o'>}</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span>
+        <span class='n'>selected</span><span class='o'>.</span><span class='na'>clear</span><span class='o'>();</span>  <span class='c1'>//清楚已经处理的建</span>
+    <span class='o'>}</span>
+
+   
+   <span class='kt'>void</span> <span class='nf'>doIO</span><span class='o'>(</span><span class='n'>List</span><span class='o'>&lt;</span><span class='n'>Packet</span><span class='o'>&gt;</span> <span class='n'>pendingQueue</span><span class='o'>,</span> <span class='n'>LinkedList</span><span class='o'>&lt;</span><span class='n'>Packet</span><span class='o'>&gt;</span> <span class='n'>outgoingQueue</span><span class='o'>,</span> <span class='n'>ClientCnxn</span> <span class='n'>cnxn</span><span class='o'>)</span>
+      <span class='kd'>throws</span> <span class='n'>InterruptedException</span><span class='o'>,</span> <span class='n'>IOException</span> <span class='o'>{</span>
+        <span class='n'>SocketChannel</span> <span class='n'>sock</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>SocketChannel</span><span class='o'>)</span> <span class='n'>sockKey</span><span class='o'>.</span><span class='na'>channel</span><span class='o'>();</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>sock</span> <span class='o'>==</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+            <span class='k'>throw</span> <span class='k'>new</span> <span class='nf'>IOException</span><span class='o'>(</span><span class='s'>&quot;Socket is null!&quot;</span><span class='o'>);</span>
+        <span class='o'>}</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>sockKey</span><span class='o'>.</span><span class='na'>isReadable</span><span class='o'>())</span> <span class='o'>{</span>  <span class='c1'>//是否有可读的数据</span>
+            <span class='kt'>int</span> <span class='n'>rc</span> <span class='o'>=</span> <span class='n'>sock</span><span class='o'>.</span><span class='na'>read</span><span class='o'>(</span><span class='n'>incomingBuffer</span><span class='o'>);</span>
+            <span class='k'>if</span> <span class='o'>(</span><span class='n'>rc</span> <span class='o'>&lt;</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='k'>throw</span> <span class='k'>new</span> <span class='nf'>EndOfStreamException</span><span class='o'>(</span>
+                        <span class='s'>&quot;Unable to read additional data from server sessionid 0x&quot;</span>
+                                <span class='o'>+</span> <span class='n'>Long</span><span class='o'>.</span><span class='na'>toHexString</span><span class='o'>(</span><span class='n'>sessionId</span><span class='o'>)</span>
+                                <span class='o'>+</span> <span class='s'>&quot;, likely server has closed socket&quot;</span><span class='o'>);</span>
+            <span class='o'>}</span>
+            <span class='k'>if</span> <span class='o'>(!</span><span class='n'>incomingBuffer</span><span class='o'>.</span><span class='na'>hasRemaining</span><span class='o'>())</span> <span class='o'>{</span>
+                <span class='n'>incomingBuffer</span><span class='o'>.</span><span class='na'>flip</span><span class='o'>();</span> 
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>incomingBuffer</span> <span class='o'>==</span> <span class='n'>lenBuffer</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='n'>recvCount</span><span class='o'>++;</span>
+                    <span class='n'>readLength</span><span class='o'>();</span>  <span class='c1'>//读取数据的长度，调用ByteBuffer重新分配incomingBuffer的长度</span>
+                <span class='o'>}</span> <span class='k'>else</span> <span class='k'>if</span> <span class='o'>(!</span><span class='n'>initialized</span><span class='o'>)</span> <span class='o'>{</span>  <span class='c1'>//在连接未建立时,initialized为false</span>
+                    <span class='n'>readConnectResult</span><span class='o'>();</span>   <span class='c1'>//读取response建立连接</span>
+                    <span class='n'>enableRead</span><span class='o'>();</span>
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>findSendablePacket</span><span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>,</span>
+                            <span class='n'>cnxn</span><span class='o'>.</span><span class='na'>sendThread</span><span class='o'>.</span><span class='na'>clientTunneledAuthenticationInProgress</span><span class='o'>())</span> <span class='o'>!=</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+                        <span class='c1'>// Since SASL authentication has completed (if client is configured to do so),</span>
+                        <span class='c1'>// outgoing packets waiting in the outgoingQueue can now be sent.</span>
+                        <span class='n'>enableWrite</span><span class='o'>();</span>
+                    <span class='o'>}</span>
+                    <span class='n'>lenBuffer</span><span class='o'>.</span><span class='na'>clear</span><span class='o'>();</span>
+                    <span class='n'>incomingBuffer</span> <span class='o'>=</span> <span class='n'>lenBuffer</span><span class='o'>;</span>
+                    <span class='n'>updateLastHeard</span><span class='o'>();</span>
+                    <span class='n'>initialized</span> <span class='o'>=</span> <span class='kc'>true</span><span class='o'>;</span>  <span class='c1'>//初始化完成</span>
+                <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+                    <span class='n'>sendThread</span><span class='o'>.</span><span class='na'>readResponse</span><span class='o'>(</span><span class='n'>incomingBuffer</span><span class='o'>);</span> <span class='c1'>//当连接建立时直接读取消息</span>
+                    <span class='n'>lenBuffer</span><span class='o'>.</span><span class='na'>clear</span><span class='o'>();</span>
+                    <span class='n'>incomingBuffer</span> <span class='o'>=</span> <span class='n'>lenBuffer</span><span class='o'>;</span>
+                    <span class='n'>updateLastHeard</span><span class='o'>();</span>
+                <span class='o'>}</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>sockKey</span><span class='o'>.</span><span class='na'>isWritable</span><span class='o'>())</span> <span class='o'>{</span>   <span class='c1'>//写入的管道可用</span>
+            <span class='kd'>synchronized</span><span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='n'>Packet</span> <span class='n'>p</span> <span class='o'>=</span> <span class='n'>findSendablePacket</span><span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>,</span>
+                        <span class='n'>cnxn</span><span class='o'>.</span><span class='na'>sendThread</span><span class='o'>.</span><span class='na'>clientTunneledAuthenticationInProgress</span><span class='o'>());</span>  <span class='c1'>//得到首个需要发送的Packet</span>
+
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span> <span class='o'>!=</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='n'>updateLastSend</span><span class='o'>();</span>
+                    <span class='c1'>// If we already started writing p, p.bb will already exist</span>
+                    <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>bb</span> <span class='o'>==</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+                        <span class='k'>if</span> <span class='o'>((</span><span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span> <span class='o'>!=</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>&amp;&amp;</span>
+                                <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getType</span><span class='o'>()</span> <span class='o'>!=</span> <span class='n'>OpCode</span><span class='o'>.</span><span class='na'>ping</span><span class='o'>)</span> <span class='o'>&amp;&amp;</span>
+                                <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getType</span><span class='o'>()</span> <span class='o'>!=</span> <span class='n'>OpCode</span><span class='o'>.</span><span class='na'>auth</span><span class='o'>))</span> <span class='o'>{</span>
+                            <span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>setXid</span><span class='o'>(</span><span class='n'>cnxn</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>());</span>  <span class='c1'>//ping和auth的消息不需要发送xid</span>
+                        <span class='o'>}</span>
+                        <span class='n'>p</span><span class='o'>.</span><span class='na'>createBB</span><span class='o'>();</span>
+                    <span class='o'>}</span>
+                    <span class='n'>sock</span><span class='o'>.</span><span class='na'>write</span><span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>bb</span><span class='o'>);</span> <span class='c1'>//写入数据</span>
+                    <span class='k'>if</span> <span class='o'>(!</span><span class='n'>p</span><span class='o'>.</span><span class='na'>bb</span><span class='o'>.</span><span class='na'>hasRemaining</span><span class='o'>())</span> <span class='o'>{</span>
+                        <span class='n'>sentCount</span><span class='o'>++;</span>
+                        <span class='n'>outgoingQueue</span><span class='o'>.</span><span class='na'>removeFirstOccurrence</span><span class='o'>(</span><span class='n'>p</span><span class='o'>);</span> <span class='c1'>//当消息完全写入后将Packet从outgoingQueue中移除</span>
+                        <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span> <span class='o'>!=</span> <span class='kc'>null</span>
+                                <span class='o'>&amp;&amp;</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getType</span><span class='o'>()</span> <span class='o'>!=</span> <span class='n'>OpCode</span><span class='o'>.</span><span class='na'>ping</span>
+                                <span class='o'>&amp;&amp;</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getType</span><span class='o'>()</span> <span class='o'>!=</span> <span class='n'>OpCode</span><span class='o'>.</span><span class='na'>auth</span><span class='o'>)</span> <span class='o'>{</span>
+                            <span class='kd'>synchronized</span> <span class='o'>(</span><span class='n'>pendingQueue</span><span class='o'>)</span> <span class='o'>{</span>
+                                <span class='n'>pendingQueue</span><span class='o'>.</span><span class='na'>add</span><span class='o'>(</span><span class='n'>p</span><span class='o'>);</span>  <span class='c1'>//如果不是ping和auth的消息则放入pendingQueue中</span>
+                            <span class='o'>}</span>
+                        <span class='o'>}</span>
+                    <span class='o'>}</span>
+                <span class='o'>}</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>outgoingQueue</span><span class='o'>.</span><span class='na'>isEmpty</span><span class='o'>())</span> <span class='o'>{</span> <span class='c1'>//判断outgoingQueue是否为空,空则disableWrite,反之亦然</span>
+                    <span class='n'>disableWrite</span><span class='o'>();</span>
+                <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+                    <span class='n'>enableWrite</span><span class='o'>();</span>
+                <span class='o'>}</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span>
+    <span class='o'>}</span>
+  
+</code></pre></div>
+<p>readConnectResult方法最终会调用sendThread中的onConnected完成连接</p>
+<div class='highlight'><pre><code class='java'> <span class='kt'>void</span> <span class='nf'>onConnected</span><span class='o'>(</span><span class='kt'>int</span> <span class='n'>_negotiatedSessionTimeout</span><span class='o'>,</span> <span class='kt'>long</span> <span class='n'>_sessionId</span><span class='o'>,</span>
+                <span class='kt'>byte</span><span class='o'>[]</span> <span class='n'>_sessionPasswd</span><span class='o'>,</span> <span class='kt'>boolean</span> <span class='n'>isRO</span><span class='o'>)</span> <span class='kd'>throws</span> <span class='n'>IOException</span> <span class='o'>{</span>
+            <span class='n'>negotiatedSessionTimeout</span> <span class='o'>=</span> <span class='n'>_negotiatedSessionTimeout</span><span class='o'>;</span>
+	      <span class='o'>...</span>
+            <span class='k'>if</span> <span class='o'>(!</span><span class='n'>readOnly</span> <span class='o'>&amp;&amp;</span> <span class='n'>isRO</span><span class='o'>)</span> <span class='o'>{</span> <span class='c1'>//客户端设置是可读写的但是服务端仅是只读记入错误</span>
+                <span class='n'>LOG</span><span class='o'>.</span><span class='na'>error</span><span class='o'>(</span><span class='s'>&quot;Read/write client got connected to read-only server&quot;</span><span class='o'>);</span>
+            <span class='o'>}</span>
+            <span class='n'>readTimeout</span> <span class='o'>=</span> <span class='n'>negotiatedSessionTimeout</span> <span class='o'>*</span> <span class='mi'>2</span> <span class='o'>/</span> <span class='mi'>3</span><span class='o'>;</span>  <span class='c1'>//根据服务端回复的sessionTimeou重新设置这两个值</span>
+            <span class='n'>connectTimeout</span> <span class='o'>=</span> <span class='n'>negotiatedSessionTimeout</span> <span class='o'>/</span> <span class='n'>hostProvider</span><span class='o'>.</span><span class='na'>size</span><span class='o'>();</span>
+            <span class='n'>hostProvider</span><span class='o'>.</span><span class='na'>onConnected</span><span class='o'>();</span>
+            <span class='n'>sessionId</span> <span class='o'>=</span> <span class='n'>_sessionId</span><span class='o'>;</span>  <span class='c1'>//客户端的sessionId设置为服务端分配的sessionId</span>
+            <span class='n'>sessionPasswd</span> <span class='o'>=</span> <span class='n'>_sessionPasswd</span><span class='o'>;</span>  <span class='c1'>//密码也设置为服务端提供的</span>
+            <span class='n'>state</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>isRO</span><span class='o'>)</span> <span class='o'>?</span>
+                    <span class='n'>States</span><span class='o'>.</span><span class='na'>CONNECTEDREADONLY</span> <span class='o'>:</span> <span class='n'>States</span><span class='o'>.</span><span class='na'>CONNECTED</span><span class='o'>;</span> <span class='c1'>//根据服务端的是否可读写设置state的状态</span>
+            <span class='n'>seenRwServerBefore</span> <span class='o'>|=</span> <span class='o'>!</span><span class='n'>isRO</span><span class='o'>;</span>
+            <span class='n'>KeeperState</span> <span class='n'>eventState</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>isRO</span><span class='o'>)</span> <span class='o'>?</span>
+                    <span class='n'>KeeperState</span><span class='o'>.</span><span class='na'>ConnectedReadOnly</span> <span class='o'>:</span> <span class='n'>KeeperState</span><span class='o'>.</span><span class='na'>SyncConnected</span><span class='o'>;</span>
+            <span class='n'>eventThread</span><span class='o'>.</span><span class='na'>queueEvent</span><span class='o'>(</span><span class='k'>new</span> <span class='n'>WatchedEvent</span><span class='o'>(</span> <span class='c1'>//将事件放入waittingQueue中待EventThread线程处理</span>
+                    <span class='n'>Watcher</span><span class='o'>.</span><span class='na'>Event</span><span class='o'>.</span><span class='na'>EventType</span><span class='o'>.</span><span class='na'>None</span><span class='o'>,</span>
+                    <span class='n'>eventState</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>));</span>
+        <span class='o'>}</span>
+</code></pre></div>
+<h3 id='create'>客户端发送一个create请求</h3>
+
+<p>客户端程序通过调用Zookeeper的create函数发送create的Packet,函数等待Packet的完成</p>
+<div class='highlight'><pre><code class='java'>      
+    	<span class='n'>RequestHeader</span> <span class='n'>h</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>RequestHeader</span><span class='o'>();</span><span class='c1'>//请求的头消息</span>
+        <span class='n'>h</span><span class='o'>.</span><span class='na'>setType</span><span class='o'>(</span><span class='n'>ZooDefs</span><span class='o'>.</span><span class='na'>OpCode</span><span class='o'>.</span><span class='na'>create</span><span class='o'>);</span> <span class='c1'>//设置请求头消息的类型</span>
+        <span class='n'>CreateRequest</span> <span class='n'>request</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>CreateRequest</span><span class='o'>();</span> <span class='c1'>//请求的消息封装</span>
+        <span class='n'>CreateResponse</span> <span class='n'>response</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>CreateResponse</span><span class='o'>();</span> <span class='c1'>//返回消息的封装</span>
+        <span class='n'>request</span><span class='o'>.</span><span class='na'>setData</span><span class='o'>(</span><span class='n'>data</span><span class='o'>);</span> <span class='c1'>//塞入创建的数据</span>
+        <span class='n'>request</span><span class='o'>.</span><span class='na'>setFlags</span><span class='o'>(</span><span class='n'>createMode</span><span class='o'>.</span><span class='na'>toFlag</span><span class='o'>());</span><span class='c1'>//创建节点的类型</span>
+        <span class='n'>request</span><span class='o'>.</span><span class='na'>setPath</span><span class='o'>(</span><span class='n'>serverPath</span><span class='o'>);</span> <span class='c1'>//服务端路径</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>acl</span> <span class='o'>!=</span> <span class='kc'>null</span> <span class='o'>&amp;&amp;</span> <span class='n'>acl</span><span class='o'>.</span><span class='na'>size</span><span class='o'>()</span> <span class='o'>==</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+            <span class='k'>throw</span> <span class='k'>new</span> <span class='n'>KeeperException</span><span class='o'>.</span><span class='na'>InvalidACLException</span><span class='o'>();</span>
+        <span class='o'>}</span>
+        <span class='n'>request</span><span class='o'>.</span><span class='na'>setAcl</span><span class='o'>(</span><span class='n'>acl</span><span class='o'>);</span> <span class='c1'>//acl控制权限</span>
+        <span class='n'>ReplyHeader</span> <span class='n'>r</span> <span class='o'>=</span> <span class='n'>cnxn</span><span class='o'>.</span><span class='na'>submitRequest</span><span class='o'>(</span><span class='n'>h</span><span class='o'>,</span> <span class='n'>request</span><span class='o'>,</span> <span class='n'>response</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>);</span> <span class='c1'>//利用cnxn提交请求</span>
+
+	
+    	<span class='kd'>public</span> <span class='n'>ReplyHeader</span> <span class='nf'>submitRequest</span><span class='o'>(</span><span class='n'>RequestHeader</span> <span class='n'>h</span><span class='o'>,</span> <span class='n'>Record</span> <span class='n'>request</span><span class='o'>,</span>
+            <span class='n'>Record</span> <span class='n'>response</span><span class='o'>,</span> <span class='n'>WatchRegistration</span> <span class='n'>watchRegistration</span><span class='o'>)</span>
+            <span class='kd'>throws</span> <span class='n'>InterruptedException</span> <span class='o'>{</span>
+        	<span class='n'>ReplyHeader</span> <span class='n'>r</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>ReplyHeader</span><span class='o'>();</span>  <span class='c1'>//返回的头消息封装</span>
+	        <span class='n'>Packet</span> <span class='n'>packet</span> <span class='o'>=</span> <span class='n'>queuePacket</span><span class='o'>(</span><span class='n'>h</span><span class='o'>,</span> <span class='n'>r</span><span class='o'>,</span> <span class='n'>request</span><span class='o'>,</span> <span class='n'>response</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>,</span>
+                    <span class='kc'>null</span><span class='o'>,</span> <span class='n'>watchRegistration</span><span class='o'>);</span> <span class='c1'>//封装好发送的Packet,往OutgoingQueue提交等待处理</span>
+        	<span class='kd'>synchronized</span> <span class='o'>(</span><span class='n'>packet</span><span class='o'>)</span> <span class='o'>{</span>
+	            <span class='k'>while</span> <span class='o'>(!</span><span class='n'>packet</span><span class='o'>.</span><span class='na'>finished</span><span class='o'>)</span> <span class='o'>{</span>  <span class='c1'>//调用函数等待直到服务端响应消息完成</span>
+        	        <span class='n'>packet</span><span class='o'>.</span><span class='na'>wait</span><span class='o'>();</span>
+	            <span class='o'>}</span>
+	        <span class='o'>}</span>
+        	<span class='k'>return</span> <span class='n'>r</span><span class='o'>;</span>
+	    <span class='o'>}</span>
+</code></pre></div>
+<p>接着进入上边sengThread提到的轮循处理的过程，待管道读到服务端的响应后进入sendThread.readResponse(incomingBuffer)方法，完成消息的响应的处理过程</p>
+<div class='highlight'><pre><code class='java'>	
+	<span class='kt'>void</span> <span class='nf'>readResponse</span><span class='o'>(</span><span class='n'>ByteBuffer</span> <span class='n'>incomingBuffer</span><span class='o'>)</span> <span class='kd'>throws</span> <span class='n'>IOException</span> <span class='o'>{</span>
+        
+	    <span class='n'>ByteBufferInputStream</span> <span class='n'>bbis</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>ByteBufferInputStream</span><span class='o'>(</span>
+                    <span class='n'>incomingBuffer</span><span class='o'>);</span>
+            <span class='n'>BinaryInputArchive</span> <span class='n'>bbia</span> <span class='o'>=</span> <span class='n'>BinaryInputArchive</span><span class='o'>.</span><span class='na'>getArchive</span><span class='o'>(</span><span class='n'>bbis</span><span class='o'>);</span>
+            <span class='n'>ReplyHeader</span> <span class='n'>replyHdr</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>ReplyHeader</span><span class='o'>();</span>
+            <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>deserialize</span><span class='o'>(</span><span class='n'>bbia</span><span class='o'>,</span> <span class='s'>&quot;header&quot;</span><span class='o'>);</span> <span class='c1'>//反序列化得到返回的头消息</span>
+            <span class='k'>if</span> <span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span> <span class='o'>==</span> <span class='o'>-</span><span class='mi'>2</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='c1'>// -2 is the xid for pings</span>
+		<span class='c1'>//-2 表示ping的消息回馈，再debug的情况下记录日志然后返回不进行其他操作</span>
+                <span class='k'>return</span><span class='o'>;</span>
+            <span class='o'>}</span>
+            <span class='k'>if</span> <span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span> <span class='o'>==</span> <span class='o'>-</span><span class='mi'>4</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='c1'>// -4 is the xid for AuthPacket               </span>
+                <span class='k'>if</span><span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>()</span> <span class='o'>==</span> <span class='n'>KeeperException</span><span class='o'>.</span><span class='na'>Code</span><span class='o'>.</span><span class='na'>AUTHFAILED</span><span class='o'>.</span><span class='na'>intValue</span><span class='o'>())</span> <span class='o'>{</span>
+                    <span class='n'>state</span> <span class='o'>=</span> <span class='n'>States</span><span class='o'>.</span><span class='na'>AUTH_FAILED</span><span class='o'>;</span>   <span class='c1'>//向waittingQueue丢入授权失败的event                 </span>
+                    <span class='n'>eventThread</span><span class='o'>.</span><span class='na'>queueEvent</span><span class='o'>(</span> <span class='k'>new</span> <span class='n'>WatchedEvent</span><span class='o'>(</span><span class='n'>Watcher</span><span class='o'>.</span><span class='na'>Event</span><span class='o'>.</span><span class='na'>EventType</span><span class='o'>.</span><span class='na'>None</span><span class='o'>,</span> 
+                            <span class='n'>Watcher</span><span class='o'>.</span><span class='na'>Event</span><span class='o'>.</span><span class='na'>KeeperState</span><span class='o'>.</span><span class='na'>AuthFailed</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>);</span> <span class='c1'>//将会从WathcerManager中得到所有的wathch进行处理      		            		</span>
+                <span class='o'>}</span>
+                <span class='k'>return</span><span class='o'>;</span>
+            <span class='o'>}</span>
+            <span class='k'>if</span> <span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span> <span class='o'>==</span> <span class='o'>-</span><span class='mi'>1</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='c1'>// -1 means notification</span>
+                <span class='n'>WatcherEvent</span> <span class='n'>event</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>WatcherEvent</span><span class='o'>();</span>
+                <span class='n'>event</span><span class='o'>.</span><span class='na'>deserialize</span><span class='o'>(</span><span class='n'>bbia</span><span class='o'>,</span> <span class='s'>&quot;response&quot;</span><span class='o'>);</span>
+		<span class='o'>...</span>
+                <span class='n'>WatchedEvent</span> <span class='n'>we</span> <span class='o'>=</span> <span class='k'>new</span> <span class='n'>WatchedEvent</span><span class='o'>(</span><span class='n'>event</span><span class='o'>);</span>
+                <span class='n'>eventThread</span><span class='o'>.</span><span class='na'>queueEvent</span><span class='o'>(</span> <span class='n'>we</span> <span class='o'>);</span>  <span class='c1'>//该方法会从WatcherManager中得到所管理的响应的event</span>
+					       <span class='c1'>//然后将event封装成WatcherSetEventPair丢入waittingQueue中等待EventThread的处理</span>
+                <span class='k'>return</span><span class='o'>;</span>
+            <span class='o'>}</span>
+	   <span class='o'>...</span>
+
+            <span class='n'>Packet</span> <span class='n'>packet</span><span class='o'>;</span>
+            <span class='kd'>synchronized</span> <span class='o'>(</span><span class='n'>pendingQueue</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>pendingQueue</span><span class='o'>.</span><span class='na'>size</span><span class='o'>()</span> <span class='o'>==</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='k'>throw</span> <span class='k'>new</span> <span class='nf'>IOException</span><span class='o'>(</span><span class='s'>&quot;Nothing in the queue, but got &quot;</span>
+                            <span class='o'>+</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>());</span>
+                <span class='o'>}</span>
+                <span class='n'>packet</span> <span class='o'>=</span> <span class='n'>pendingQueue</span><span class='o'>.</span><span class='na'>remove</span><span class='o'>();</span>  <span class='c1'>//从pendingQueue中移除等待响应的Packet</span>
+            <span class='o'>}</span>
+            <span class='cm'>/*</span>
+<span class='cm'>             * Since requests are processed in order, we better get a response</span>
+<span class='cm'>             * to the first request!</span>
+<span class='cm'>             */</span>
+            <span class='k'>try</span> <span class='o'>{</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>packet</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span> <span class='o'>!=</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>())</span> <span class='o'>{</span>  <span class='c1'>//当请求的xid与服务端的xid不相等时,标识错误,抛出失去连接的错误</span>
+                    <span class='n'>packet</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>setErr</span><span class='o'>(</span>
+                            <span class='n'>KeeperException</span><span class='o'>.</span><span class='na'>Code</span><span class='o'>.</span><span class='na'>CONNECTIONLOSS</span><span class='o'>.</span><span class='na'>intValue</span><span class='o'>());</span>
+                    <span class='k'>throw</span> <span class='k'>new</span> <span class='nf'>IOException</span><span class='o'>(</span><span class='s'>&quot;Xid out of order. Got Xid &quot;</span>
+                            <span class='o'>+</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span> <span class='o'>+</span> <span class='s'>&quot; with err &quot;</span> <span class='o'>+</span>
+                            <span class='o'>+</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>()</span> <span class='o'>+</span>
+                            <span class='s'>&quot; expected Xid &quot;</span>
+                            <span class='o'>+</span> <span class='n'>packet</span><span class='o'>.</span><span class='na'>requestHeader</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>()</span>
+                            <span class='o'>+</span> <span class='s'>&quot; for a packet with details: &quot;</span>
+                            <span class='o'>+</span> <span class='n'>packet</span> <span class='o'>);</span>
+                <span class='o'>}</span>
+
+                <span class='n'>packet</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>setXid</span><span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getXid</span><span class='o'>());</span> <span class='c1'>//将返回的头消息放回等待的packet中</span>
+                <span class='n'>packet</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>setErr</span><span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>());</span>
+                <span class='n'>packet</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>setZxid</span><span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getZxid</span><span class='o'>());</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getZxid</span><span class='o'>()</span> <span class='o'>&gt;</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='n'>lastZxid</span> <span class='o'>=</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getZxid</span><span class='o'>();</span>  <span class='c1'>//更新最后的lastZxid</span>
+                <span class='o'>}</span>
+                <span class='k'>if</span> <span class='o'>(</span><span class='n'>packet</span><span class='o'>.</span><span class='na'>response</span> <span class='o'>!=</span> <span class='kc'>null</span> <span class='o'>&amp;&amp;</span> <span class='n'>replyHdr</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>()</span> <span class='o'>==</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                    <span class='n'>packet</span><span class='o'>.</span><span class='na'>response</span><span class='o'>.</span><span class='na'>deserialize</span><span class='o'>(</span><span class='n'>bbia</span><span class='o'>,</span> <span class='s'>&quot;response&quot;</span><span class='o'>);</span>
+                <span class='o'>}</span>
+            <span class='o'>}</span> <span class='k'>finally</span> <span class='o'>{</span>
+                <span class='n'>finishPacket</span><span class='o'>(</span><span class='n'>packet</span><span class='o'>);</span>  <span class='c1'>//调用该函数完成packet的最后一个步骤</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span>
+
+    <span class='kd'>private</span> <span class='kt'>void</span> <span class='nf'>finishPacket</span><span class='o'>(</span><span class='n'>Packet</span> <span class='n'>p</span><span class='o'>)</span> <span class='o'>{</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>watchRegistration</span> <span class='o'>!=</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+            <span class='n'>p</span><span class='o'>.</span><span class='na'>watchRegistration</span><span class='o'>.</span><span class='na'>register</span><span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>());</span> <span class='c1'>//当返回的消息正确的情况下将watch放入WatcherManager中</span>
+        <span class='o'>}</span>
+        <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>cb</span> <span class='o'>==</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>  <span class='c1'>//如果Packet未设置回调函数则标识完成通知等待的线程</span>
+            <span class='kd'>synchronized</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>)</span> <span class='o'>{</span>
+                <span class='n'>p</span><span class='o'>.</span><span class='na'>finished</span> <span class='o'>=</span> <span class='kc'>true</span><span class='o'>;</span> 
+                <span class='n'>p</span><span class='o'>.</span><span class='na'>notifyAll</span><span class='o'>();</span>
+            <span class='o'>}</span>
+        <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+            <span class='n'>p</span><span class='o'>.</span><span class='na'>finished</span> <span class='o'>=</span> <span class='kc'>true</span><span class='o'>;</span> <span class='c1'>//标识完成</span>
+            <span class='n'>eventThread</span><span class='o'>.</span><span class='na'>queuePacket</span><span class='o'>(</span><span class='n'>p</span><span class='o'>);</span> <span class='c1'>//将packet丢入waittingQueue中等待EventThread调用相应的回调方法</span>
+        <span class='o'>}</span>
+    <span class='o'>}</span>	
+</code></pre></div>
+<p>最后在看一下EventThread对waittingQueue所做的操作</p>
+<div class='highlight'><pre><code class='java'>     <span class='kd'>private</span> <span class='kt'>void</span> <span class='nf'>processEvent</span><span class='o'>(</span><span class='n'>Object</span> <span class='n'>event</span><span class='o'>)</span> <span class='o'>{</span>
+          <span class='k'>try</span> <span class='o'>{</span>
+              <span class='k'>if</span> <span class='o'>(</span><span class='n'>event</span> <span class='k'>instanceof</span> <span class='n'>WatcherSetEventPair</span><span class='o'>)</span> <span class='o'>{</span>   <span class='c1'>//对于event的操作根据类型分为两类</span>
+							<span class='c1'>//第一是先前封装的WatcherSetEvetnPair针对返回的头消息是-4和-1所做的操作</span>
+						        <span class='c1'>//根据返回的WatchManager所管理的Watch分别调用各自的process函数处理</span>
+                  <span class='n'>WatcherSetEventPair</span> <span class='n'>pair</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>WatcherSetEventPair</span><span class='o'>)</span> <span class='n'>event</span><span class='o'>;</span>
+                  <span class='k'>for</span> <span class='o'>(</span><span class='n'>Watcher</span> <span class='n'>watcher</span> <span class='o'>:</span> <span class='n'>pair</span><span class='o'>.</span><span class='na'>watchers</span><span class='o'>)</span> <span class='o'>{</span>
+                      <span class='k'>try</span> <span class='o'>{</span>
+                          <span class='n'>watcher</span><span class='o'>.</span><span class='na'>process</span><span class='o'>(</span><span class='n'>pair</span><span class='o'>.</span><span class='na'>event</span><span class='o'>);</span>
+                      <span class='o'>}</span> <span class='k'>catch</span> <span class='o'>(</span><span class='n'>Throwable</span> <span class='n'>t</span><span class='o'>)</span> <span class='o'>{</span>
+                          <span class='n'>LOG</span><span class='o'>.</span><span class='na'>error</span><span class='o'>(</span><span class='s'>&quot;Error while calling watcher &quot;</span><span class='o'>,</span> <span class='n'>t</span><span class='o'>);</span>
+                      <span class='o'>}</span>
+                  <span class='o'>}</span>
+              <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>  
+                  <span class='c1'>//第二种是包含cb所进行的回调处理</span>
+                  <span class='c1'>//根据Packet中设置的返回消息回调类型通过cb来完成</span>
+                  <span class='n'>Packet</span> <span class='n'>p</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>Packet</span><span class='o'>)</span> <span class='n'>event</span><span class='o'>;</span>
+                  <span class='kt'>int</span> <span class='n'>rc</span> <span class='o'>=</span> <span class='mi'>0</span><span class='o'>;</span>
+                  <span class='n'>String</span> <span class='n'>clientPath</span> <span class='o'>=</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>clientPath</span><span class='o'>;</span>
+                  <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>()</span> <span class='o'>!=</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                      <span class='n'>rc</span> <span class='o'>=</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>replyHeader</span><span class='o'>.</span><span class='na'>getErr</span><span class='o'>();</span>
+                  <span class='o'>}</span>
+                  <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>cb</span> <span class='o'>==</span> <span class='kc'>null</span><span class='o'>)</span> <span class='o'>{</span>
+                      <span class='n'>LOG</span><span class='o'>.</span><span class='na'>warn</span><span class='o'>(</span><span class='s'>&quot;Somehow a null cb got to EventThread!&quot;</span><span class='o'>);</span>
+                  <span class='o'>}</span> <span class='k'>else</span> <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>ExistsResponse</span>
+                          <span class='o'>||</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>SetDataResponse</span>
+                          <span class='o'>||</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>SetACLResponse</span><span class='o'>)</span> <span class='o'>{</span>
+                      <span class='n'>StatCallback</span> <span class='n'>cb</span> <span class='o'>=</span> <span class='o'>(</span><span class='n'>StatCallback</span><span class='o'>)</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>cb</span><span class='o'>;</span>
+                      <span class='k'>if</span> <span class='o'>(</span><span class='n'>rc</span> <span class='o'>==</span> <span class='mi'>0</span><span class='o'>)</span> <span class='o'>{</span>
+                          <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>ExistsResponse</span><span class='o'>)</span> <span class='o'>{</span>
+                              <span class='n'>cb</span><span class='o'>.</span><span class='na'>processResult</span><span class='o'>(</span><span class='n'>rc</span><span class='o'>,</span> <span class='n'>clientPath</span><span class='o'>,</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>ctx</span><span class='o'>,</span>
+                                      <span class='o'>((</span><span class='n'>ExistsResponse</span><span class='o'>)</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>response</span><span class='o'>)</span>
+                                              <span class='o'>.</span><span class='na'>getStat</span><span class='o'>());</span>
+                          <span class='o'>}</span> <span class='k'>else</span> <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>SetDataResponse</span><span class='o'>)</span> <span class='o'>{</span>
+                              <span class='n'>cb</span><span class='o'>.</span><span class='na'>processResult</span><span class='o'>(</span><span class='n'>rc</span><span class='o'>,</span> <span class='n'>clientPath</span><span class='o'>,</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>ctx</span><span class='o'>,</span>
+                                      <span class='o'>((</span><span class='n'>SetDataResponse</span><span class='o'>)</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>response</span><span class='o'>)</span>
+                                              <span class='o'>.</span><span class='na'>getStat</span><span class='o'>());</span>
+                          <span class='o'>}</span> <span class='k'>else</span> <span class='k'>if</span> <span class='o'>(</span><span class='n'>p</span><span class='o'>.</span><span class='na'>response</span> <span class='k'>instanceof</span> <span class='n'>SetACLResponse</span><span class='o'>)</span> <span class='o'>{</span>
+                              <span class='n'>cb</span><span class='o'>.</span><span class='na'>processResult</span><span class='o'>(</span><span class='n'>rc</span><span class='o'>,</span> <span class='n'>clientPath</span><span class='o'>,</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>ctx</span><span class='o'>,</span>
+                                      <span class='o'>((</span><span class='n'>SetACLResponse</span><span class='o'>)</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>response</span><span class='o'>)</span>
+                                              <span class='o'>.</span><span class='na'>getStat</span><span class='o'>());</span>
+                          <span class='o'>}</span>
+                      <span class='o'>}</span> <span class='k'>else</span> <span class='o'>{</span>
+                          <span class='n'>cb</span><span class='o'>.</span><span class='na'>processResult</span><span class='o'>(</span><span class='n'>rc</span><span class='o'>,</span> <span class='n'>clientPath</span><span class='o'>,</span> <span class='n'>p</span><span class='o'>.</span><span class='na'>ctx</span><span class='o'>,</span> <span class='kc'>null</span><span class='o'>);</span>
+                      <span class='o'>}</span>
+                    <span class='o'>...</span>
+              <span class='o'>}</span>
+          <span class='o'>}</span> <span class='k'>catch</span> <span class='o'>(</span><span class='n'>Throwable</span> <span class='n'>t</span><span class='o'>)</span> <span class='o'>{</span>
+              <span class='n'>LOG</span><span class='o'>.</span><span class='na'>error</span><span class='o'>(</span><span class='s'>&quot;Caught unexpected throwable&quot;</span><span class='o'>,</span> <span class='n'>t</span><span class='o'>);</span>
+          <span class='o'>}</span>
+       <span class='o'>}</span>
+    <span class='o'>}</span>
+</code></pre></div>
+<p>针对Zookeeper客户端的实现逻辑和主要代码段介绍完了,看似简单但真正把代码都介绍完才慢慢体会到里边很多的细节,也算是真正意义上的看懂了,总觉着这篇文章的代码贴的太多,看得不是很舒服,下篇介绍Zookeeper实现的方式看看是否能换一种更好的方式写出来,很多事总要经历那么一个过程&#8230;</p>
+
+<p>相关链接</p>
+
+<ul>
+<li>
+<p><a href='http://www.spnguru.com/2010/08/zookeeper%E5%85%A8%E8%A7%A3%E6%9E%90%E2%80%94%E2%80%94client%E7%AB%AF/'>Zookeeper全解析——Client端</a></p>
+</li>
+
+<li>
+<p><a href='http://book.douban.com/subject/1433583/'>Java NIO</a></p>
+</li>
+
+<li>
+<p><a href='http://book.douban.com/subject/1438754/'>Java网络编程</a></p>
+</li>
+
+<li>
+<p><a href='http://log.adamwilcox.org/2013/03/25/fixing-soundcloud-embeds-on-github-pages-jekyll/'>Jekyll中引入iframe的问题</a></p>
+</li>
+</ul>
+</div>
+
+    <div id="disqus_thread"></div>
+    <script type="text/javascript">
+        /* * * CONFIGURATION VARIABLES: EDIT BEFORE PASTING INTO YOUR WEBPAGE * * */
+        var disqus_shortname = '2375'; // required: replace example with your forum shortname
+
+        /* * * DON'T EDIT BELOW THIS LINE * * */
+        (function() {
+            var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+            dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+            (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+        })();
+    </script>
+    <noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+    <a href="http://disqus.com" class="dsq-brlink">comments powered by <span class="logo-disqus">Disqus</span></a>
+
+
+            <div class="footer">
+              <div class="contact">
+                <p>
+                  Lin Yong<br />
+                  My Douban<br />
+                  fantasylinyong@gmail.com<br />
+                </p>
+              </div>
+              <div class="contact">
+                <p>
+                  <a href="http://github.com/nanchenzi/" target="_blank">github.com/nanchenzi</a><br />
+                  <a href="http://www.douban.com/people/kiss2375/" target="_blank">douban.com/people/kiss2375</a><br />
+                  <a href="http://instagram.com/kiss2375/" target="_blank">instagram.com/kiss2375</a><br />
+                </p>
+              </div>
+	      <div class="contact">
+	        <p>
+		   <a href="http://2375.me/rs.xml" target="_blank">RSS</a><br />
+                </p>
+              </div>
+            </div>
+          </div>
+        </div> <!-- /container -->
+
+    </body>
+</html>
