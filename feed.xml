@@ -1,0 +1,977 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+	<channel>
+		<title>南臣子</title>
+		<description>南方.小城.码畜.平常心.晴耕雨读.Better Me. Hadooper.Procrastination</description>
+		<link>http://2375.me/</link>
+		<atom:link href="http://2375.me//feed.xml" rel="self" type="application/rss+xml" />
+		
+			<item>
+				<title>zookeeper client端实现解析</title>
+				<description>&lt;p&gt;zookeeper 客户端的实现主要由以下三个类完成:&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;org.apache.zookeeper.ZooKeeper&lt;/li&gt;
+
+&lt;li&gt;org.apache.zookeeper.ClientCnxn&lt;/li&gt;
+
+&lt;li&gt;org.apache.zookeeper.ClientCnxnSocketNIO&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;org.apache.zookeeper.ZooKeeper主要是一层api的封装,客户端程序用到一个Zookeeper实例就可以进行所有的操作&lt;/p&gt;
+
+&lt;p&gt;ZKWatchManager是在org.apache.zookeeper.ZooKeeper下的内部类,包含三个私有属性dataWatches、existWatches、childWatches, ZKWatchManager主要负责管理所有ClientCnxn从server集群上得到Watch事件&lt;/p&gt;
+
+&lt;p&gt;ClientCnxn是client端的核心实现,其中包含了两个轮寻的线程SendThread和EventThread,SendThread主要轮循从outgoingQueue队列中取得Zookeeper塞入的Packet包,通过ClientCnxnSocketNIO发送给服务器,并把发送的packet塞入pendingQueue队列中等待服务端的response,同时也从同服务端建立的管道中读取response把相应的packet移出pendingQueue,放入EventThrad负责处理的waitingEvents队列中,SendThread也负责和集群连接的建立、断开和session的ping连接,EventThread负责处理waitingEvent队列中packet,把packet中finished标识为true，使得阻塞的客户端函数返回并且取得packet中的response,根据不同的response调用不同的回调实现方法处理事件，其中waitingEvent队列采用LinkedBlockingQueue&lt;/p&gt;
+
+&lt;p&gt;ClientCnxnSocketNIO则是负责网络的通信，管道连接的建立，选择器的select操作,read和write的管道读写操作&lt;/p&gt;
+&lt;p&gt;&lt;iframe frameborder='0' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;' src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
+&lt;h3 id='id1'&gt;连接的建立&lt;/h3&gt;
+
+&lt;p&gt;参考org.apache.zookeeper.ZooKeeperMain中的main函数作为入口跟踪连接的建立&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt; &lt;span class='c1'&gt;//ZooKeeper的构造函数&lt;/span&gt;
+ &lt;span class='kd'&gt;public&lt;/span&gt; &lt;span class='nf'&gt;ZooKeeper&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;String&lt;/span&gt; &lt;span class='n'&gt;connectString&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;Watcher&lt;/span&gt; &lt;span class='n'&gt;watcher&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+            &lt;span class='kt'&gt;boolean&lt;/span&gt; &lt;span class='n'&gt;canBeReadOnly&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+        &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;IOException&lt;/span&gt;
+    &lt;span class='o'&gt;{&lt;/span&gt;
+
+        &lt;span class='n'&gt;watchManager&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;defaultWatcher&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;watcher&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//默认的实现了process方法的watch&lt;/span&gt;
+
+        &lt;span class='n'&gt;ConnectStringParser&lt;/span&gt; &lt;span class='n'&gt;connectStringParser&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;ConnectStringParser&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                &lt;span class='n'&gt;connectString&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//解析传入的hostsStr,用于指定chrootPath和生成多个InetSocketAddress集合&lt;/span&gt;
+        &lt;span class='n'&gt;HostProvider&lt;/span&gt; &lt;span class='n'&gt;hostProvider&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;StaticHostProvider&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                &lt;span class='n'&gt;connectStringParser&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getServerAddresses&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;  &lt;span class='c1'&gt;//提供InetSocketAddress的工具类&lt;/span&gt;
+                                                            &lt;span class='c1'&gt;//其中的Collections.shuffle(this.serverAddresses)&lt;/span&gt;
+                                                            &lt;span class='c1'&gt;//保证客户端请求集群中不同的机器，避免羊群效应&lt;/span&gt;
+        &lt;span class='n'&gt;cnxn&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;ClientCnxn&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;connectStringParser&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getChrootPath&lt;/span&gt;&lt;span class='o'&gt;(),&lt;/span&gt;
+                &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;watchManager&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                &lt;span class='n'&gt;getClientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;(),&lt;/span&gt; &lt;span class='n'&gt;canBeReadOnly&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+	&lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;start&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//启动线程sendThread和eventThread&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+  
+   &lt;span class='c1'&gt;//ClinetCnxn的构造函数&lt;/span&gt;
+    &lt;span class='kd'&gt;public&lt;/span&gt; &lt;span class='nf'&gt;ClientCnxn&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;String&lt;/span&gt; &lt;span class='n'&gt;chrootPath&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;HostProvider&lt;/span&gt; &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;ZooKeeper&lt;/span&gt; &lt;span class='n'&gt;zooKeeper&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+            &lt;span class='n'&gt;ClientWatchManager&lt;/span&gt; &lt;span class='n'&gt;watcher&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;ClientCnxnSocket&lt;/span&gt; &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+            &lt;span class='kt'&gt;long&lt;/span&gt; &lt;span class='n'&gt;sessionId&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;byte&lt;/span&gt;&lt;span class='o'&gt;[]&lt;/span&gt; &lt;span class='n'&gt;sessionPasswd&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;boolean&lt;/span&gt; &lt;span class='n'&gt;canBeReadOnly&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;zooKeeper&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;zooKeeper&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;watcher&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;watcher&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sessionId&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sessionId&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//初始为0 &lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sessionPasswd&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sessionPasswd&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//初始为new byte[16]&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sessionTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//设置为3000ms&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hostProvider&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;chrootPath&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;chrootPath&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+        &lt;span class='n'&gt;connectTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;size&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//连接的timeout设置为sessionTimeOut除以InetSockAddress集合大小&lt;/span&gt;
+                                                                &lt;span class='c1'&gt;//size越大，连接timeout的值越小&lt;/span&gt;
+        &lt;span class='n'&gt;readTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sessionTimeout&lt;/span&gt; &lt;span class='o'&gt;*&lt;/span&gt; &lt;span class='mi'&gt;2&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='mi'&gt;3&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;     &lt;span class='c1'&gt;//读的timeout设为sessionTimeout的三分之二&lt;/span&gt;
+        &lt;span class='n'&gt;readOnly&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;canBeReadOnly&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+        &lt;span class='n'&gt;sendThread&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;SendThread&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='n'&gt;eventThread&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;EventThread&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+
+    &lt;span class='o'&gt;}&lt;/span&gt;   
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;在sendThread中States属性用于标识客户端与集群的连接状态,初始为NOT-CONNECTED,在线程的run方法中创建SocketChanel,并向服务端发送connect的请求消息，在read到服务端的response消息后将state修改为CONNECTED或者CONNECTEDREADONLY&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;                   &lt;span class='c1'&gt;//sendThread轮循的代码&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isConnected&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//判断ClinetCnxnSocketNIO实现类中的管道选择建是否创建，第一次运行为空进入函数&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt;&lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;isFirstConnect&lt;/span&gt;&lt;span class='o'&gt;){&lt;/span&gt; &lt;span class='c1'&gt;//如果不是第一建立连接则休眠一定的时间&lt;/span&gt;
+                            &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                                &lt;span class='n'&gt;Thread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sleep&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;r&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;nextInt&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='mi'&gt;1000&lt;/span&gt;&lt;span class='o'&gt;));&lt;/span&gt;
+                            &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;catch&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;InterruptedException&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                                &lt;span class='n'&gt;LOG&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;warn&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Unexpected exception&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                            &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='c1'&gt;// don&amp;#39;t re-establish connection if we are closing&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;closing&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='o'&gt;!&lt;/span&gt;&lt;span class='n'&gt;state&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isAlive&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='k'&gt;break&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='n'&gt;startConnect&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//将state置为CONNECTING,表示连接进行中，并且通过hostProvider提供的InetSockAddress建立管道&lt;/span&gt;
+                                        &lt;span class='c1'&gt;//向selector中注册关心OP_CONNECT的管道&lt;/span&gt;
+                        &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;updateLastSendAndHeard&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//更新客户端发送和接收的时间搓&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;state&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isConnected&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='c1'&gt;//...省略了zooKeeperSaslClient的部分代码&lt;/span&gt;
+			&lt;span class='n'&gt;to&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;readTimeout&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getIdleRecv&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//IdleRecv表示上次收到消息和now的间隔&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='n'&gt;to&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;connectTimeout&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getIdleRecv&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                    
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;to&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//小于0表示间隔大于timeout则session失效，抛出异常重新进行连接&lt;/span&gt;
+                        &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;SessionTimeoutException&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                                &lt;span class='s'&gt;&amp;quot;Client session timed out, have not heard from server in &amp;quot;&lt;/span&gt;
+                                        &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getIdleRecv&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='s'&gt;&amp;quot;ms&amp;quot;&lt;/span&gt;
+                                        &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='s'&gt;&amp;quot; for sessionid 0x&amp;quot;&lt;/span&gt;
+                                        &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;Long&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;toHexString&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sessionId&lt;/span&gt;&lt;span class='o'&gt;));&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;state&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isConnected&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;timeToNextPing&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;readTimeout&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='mi'&gt;2&lt;/span&gt;
+                                &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getIdleSend&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//在连接已经建立的条件下是否需要发送ping消息保持session&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;timeToNextPing&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='n'&gt;sendPing&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                            &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;updateLastSend&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;timeToNextPing&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='n'&gt;to&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                                &lt;span class='n'&gt;to&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;timeToNextPing&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+
+                    &lt;span class='c1'&gt;// If we are in read-only mode, seek for read/write server&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;state&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='n'&gt;States&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;CONNECTEDREADONLY&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; 
+                        &lt;span class='kt'&gt;long&lt;/span&gt; &lt;span class='n'&gt;now&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;System&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;currentTimeMillis&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;idlePingRwServer&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;now&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;lastPingRwServer&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;idlePingRwServer&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;=&lt;/span&gt; &lt;span class='n'&gt;pingRwTimeout&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='n'&gt;lastPingRwServer&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;now&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='n'&gt;idlePingRwServer&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='n'&gt;pingRwTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt;
+                                &lt;span class='n'&gt;Math&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;min&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='mi'&gt;2&lt;/span&gt;&lt;span class='o'&gt;*&lt;/span&gt;&lt;span class='n'&gt;pingRwTimeout&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;maxPingRwTimeout&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                            &lt;span class='n'&gt;pingRwServer&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//由hostProvider得到集群中的另一个InetSockAddress直接建立sock得到outputStream发送‘isro’&lt;/span&gt;
+                                           &lt;span class='c1'&gt;//判断该地址是否是rw的服务器,在是的情况下抛出异常重新连接该地址rwServerAddress&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='n'&gt;to&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;Math&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;min&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;to&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;pingRwTimeout&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;idlePingRwServer&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='n'&gt;clientCnxnSocket&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;doTransport&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;to&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;ClientCnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;this&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;&lt;span class='c1'&gt;//调用clientCnxnSocketNIO发送消息&lt;/span&gt;
+                
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;clientCnxnSocketNIO中的doTransport主要完成选择建的select()操作获得准备好的通道进行相应的操作，doIo则负责通道的读和写,这也是完成网络通信的主要方法&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;  
+ &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;doTransport&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;waitTimeOut&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;List&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;LinkedList&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                     &lt;span class='n'&gt;ClientCnxn&lt;/span&gt; &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;IOException&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;InterruptedException&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='n'&gt;selector&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;select&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;waitTimeOut&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//阻塞的等待相应的时间&lt;/span&gt;
+        &lt;span class='n'&gt;Set&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;SelectionKey&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;selected&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='kd'&gt;synchronized&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;selected&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;selector&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;selectedKeys&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//获得准备好的SelectionKey集合&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='c1'&gt;// Everything below and until we get back to the select is&lt;/span&gt;
+        &lt;span class='c1'&gt;// non blocking, so time is effectively a constant. That is&lt;/span&gt;
+        &lt;span class='c1'&gt;// Why we just have to do this once, here&lt;/span&gt;
+        &lt;span class='n'&gt;updateNow&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//之所以在这更新now的时间是因为之前的所有操作都是非阻塞的&lt;/span&gt;
+        &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;SelectionKey&lt;/span&gt; &lt;span class='n'&gt;k&lt;/span&gt; &lt;span class='o'&gt;:&lt;/span&gt; &lt;span class='n'&gt;selected&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;SocketChannel&lt;/span&gt; &lt;span class='n'&gt;sc&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;SocketChannel&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;channel&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;readyOps&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;SelectionKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;OP_CONNECT&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; &lt;span class='c1'&gt;//第一次连接时设置的key仅关心连接&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sc&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;finishConnect&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;updateLastSendAndHeard&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='n'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;primeConnection&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//添加conReq的Packet到outgoingQueue队列中等待下次发送&lt;/span&gt;
+						 &lt;span class='c1'&gt;//并且enableReadWriteOnly,等待sendThread下一次调用doTransport,进而进入下面的doIO方法的调用&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;readyOps&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;SelectionKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;OP_READ&lt;/span&gt; &lt;span class='o'&gt;|&lt;/span&gt; &lt;span class='n'&gt;SelectionKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;OP_WRITE&lt;/span&gt;&lt;span class='o'&gt;))&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;doIO&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//调用doIo发送或者读取消息&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getZkState&lt;/span&gt;&lt;span class='o'&gt;().&lt;/span&gt;&lt;span class='na'&gt;isConnected&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; &lt;span class='c1'&gt;//在连接的条件下保证outgoingQueue有数据时enableWrite&lt;/span&gt;
+            &lt;span class='kd'&gt;synchronized&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;findSendablePacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                        &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clientTunneledAuthenticationInProgress&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;enableWrite&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='n'&gt;selected&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clear&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//清楚已经处理的建&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+
+   
+   &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;doIO&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;List&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;LinkedList&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;ClientCnxn&lt;/span&gt; &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+      &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;InterruptedException&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;IOException&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='n'&gt;SocketChannel&lt;/span&gt; &lt;span class='n'&gt;sock&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;SocketChannel&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;sockKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;channel&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sock&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;IOException&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Socket is null!&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sockKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isReadable&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//是否有可读的数据&lt;/span&gt;
+            &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;rc&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;sock&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;read&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;EndOfStreamException&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                        &lt;span class='s'&gt;&amp;quot;Unable to read additional data from server sessionid 0x&amp;quot;&lt;/span&gt;
+                                &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;Long&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;toHexString&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sessionId&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                                &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='s'&gt;&amp;quot;, likely server has closed socket&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hasRemaining&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;flip&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; 
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;incomingBuffer&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='n'&gt;lenBuffer&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;recvCount&lt;/span&gt;&lt;span class='o'&gt;++;&lt;/span&gt;
+                    &lt;span class='n'&gt;readLength&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//读取数据的长度，调用ByteBuffer重新分配incomingBuffer的长度&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;initialized&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//在连接未建立时,initialized为false&lt;/span&gt;
+                    &lt;span class='n'&gt;readConnectResult&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;   &lt;span class='c1'&gt;//读取response建立连接&lt;/span&gt;
+                    &lt;span class='n'&gt;enableRead&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;findSendablePacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                            &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clientTunneledAuthenticationInProgress&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='c1'&gt;// Since SASL authentication has completed (if client is configured to do so),&lt;/span&gt;
+                        &lt;span class='c1'&gt;// outgoing packets waiting in the outgoingQueue can now be sent.&lt;/span&gt;
+                        &lt;span class='n'&gt;enableWrite&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='n'&gt;lenBuffer&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clear&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='n'&gt;incomingBuffer&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;lenBuffer&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                    &lt;span class='n'&gt;updateLastHeard&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='n'&gt;initialized&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='kc'&gt;true&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//初始化完成&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;readResponse&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//当连接建立时直接读取消息&lt;/span&gt;
+                    &lt;span class='n'&gt;lenBuffer&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clear&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='n'&gt;incomingBuffer&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;lenBuffer&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                    &lt;span class='n'&gt;updateLastHeard&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;sockKey&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isWritable&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;   &lt;span class='c1'&gt;//写入的管道可用&lt;/span&gt;
+            &lt;span class='kd'&gt;synchronized&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;Packet&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;findSendablePacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                        &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;sendThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clientTunneledAuthenticationInProgress&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;  &lt;span class='c1'&gt;//得到首个需要发送的Packet&lt;/span&gt;
+
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;updateLastSend&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='c1'&gt;// If we already started writing p, p.bb will already exist&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;bb&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt;
+                                &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getType&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;OpCode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ping&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt;
+                                &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getType&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;OpCode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;auth&lt;/span&gt;&lt;span class='o'&gt;))&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setXid&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;  &lt;span class='c1'&gt;//ping和auth的消息不需要发送xid&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;createBB&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='n'&gt;sock&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;write&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;bb&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//写入数据&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;bb&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hasRemaining&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='n'&gt;sentCount&lt;/span&gt;&lt;span class='o'&gt;++;&lt;/span&gt;
+                        &lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;removeFirstOccurrence&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//当消息完全写入后将Packet从outgoingQueue中移除&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;
+                                &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getType&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;OpCode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ping&lt;/span&gt;
+                                &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getType&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;OpCode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;auth&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='kd'&gt;synchronized&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                                &lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;add&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//如果不是ping和auth的消息则放入pendingQueue中&lt;/span&gt;
+                            &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;outgoingQueue&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;isEmpty&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; &lt;span class='c1'&gt;//判断outgoingQueue是否为空,空则disableWrite,反之亦然&lt;/span&gt;
+                    &lt;span class='n'&gt;disableWrite&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;enableWrite&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+  
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;readConnectResult方法最终会调用sendThread中的onConnected完成连接&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt; &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;onConnected&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;_negotiatedSessionTimeout&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;long&lt;/span&gt; &lt;span class='n'&gt;_sessionId&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                &lt;span class='kt'&gt;byte&lt;/span&gt;&lt;span class='o'&gt;[]&lt;/span&gt; &lt;span class='n'&gt;_sessionPasswd&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;boolean&lt;/span&gt; &lt;span class='n'&gt;isRO&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;IOException&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;negotiatedSessionTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;_negotiatedSessionTimeout&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+	      &lt;span class='o'&gt;...&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;readOnly&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;isRO&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; &lt;span class='c1'&gt;//客户端设置是可读写的但是服务端仅是只读记入错误&lt;/span&gt;
+                &lt;span class='n'&gt;LOG&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;error&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Read/write client got connected to read-only server&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='n'&gt;readTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;negotiatedSessionTimeout&lt;/span&gt; &lt;span class='o'&gt;*&lt;/span&gt; &lt;span class='mi'&gt;2&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='mi'&gt;3&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//根据服务端回复的sessionTimeou重新设置这两个值&lt;/span&gt;
+            &lt;span class='n'&gt;connectTimeout&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;negotiatedSessionTimeout&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;size&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='n'&gt;hostProvider&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;onConnected&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='n'&gt;sessionId&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;_sessionId&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//客户端的sessionId设置为服务端分配的sessionId&lt;/span&gt;
+            &lt;span class='n'&gt;sessionPasswd&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;_sessionPasswd&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//密码也设置为服务端提供的&lt;/span&gt;
+            &lt;span class='n'&gt;state&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;isRO&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;?&lt;/span&gt;
+                    &lt;span class='n'&gt;States&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;CONNECTEDREADONLY&lt;/span&gt; &lt;span class='o'&gt;:&lt;/span&gt; &lt;span class='n'&gt;States&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;CONNECTED&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//根据服务端的是否可读写设置state的状态&lt;/span&gt;
+            &lt;span class='n'&gt;seenRwServerBefore&lt;/span&gt; &lt;span class='o'&gt;|=&lt;/span&gt; &lt;span class='o'&gt;!&lt;/span&gt;&lt;span class='n'&gt;isRO&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='n'&gt;KeeperState&lt;/span&gt; &lt;span class='n'&gt;eventState&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;isRO&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;?&lt;/span&gt;
+                    &lt;span class='n'&gt;KeeperState&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ConnectedReadOnly&lt;/span&gt; &lt;span class='o'&gt;:&lt;/span&gt; &lt;span class='n'&gt;KeeperState&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;SyncConnected&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='n'&gt;eventThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;queueEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;WatchedEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt; &lt;span class='c1'&gt;//将事件放入waittingQueue中待EventThread线程处理&lt;/span&gt;
+                    &lt;span class='n'&gt;Watcher&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;Event&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;EventType&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;None&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                    &lt;span class='n'&gt;eventState&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;));&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;h3 id='create'&gt;客户端发送一个create请求&lt;/h3&gt;
+
+&lt;p&gt;客户端程序通过调用Zookeeper的create函数发送create的Packet,函数等待Packet的完成&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;      
+    	&lt;span class='n'&gt;RequestHeader&lt;/span&gt; &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;RequestHeader&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;&lt;span class='c1'&gt;//请求的头消息&lt;/span&gt;
+        &lt;span class='n'&gt;h&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setType&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;ZooDefs&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;OpCode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;create&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//设置请求头消息的类型&lt;/span&gt;
+        &lt;span class='n'&gt;CreateRequest&lt;/span&gt; &lt;span class='n'&gt;request&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;CreateRequest&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//请求的消息封装&lt;/span&gt;
+        &lt;span class='n'&gt;CreateResponse&lt;/span&gt; &lt;span class='n'&gt;response&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;CreateResponse&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//返回消息的封装&lt;/span&gt;
+        &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setData&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;data&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//塞入创建的数据&lt;/span&gt;
+        &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setFlags&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;createMode&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;toFlag&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;&lt;span class='c1'&gt;//创建节点的类型&lt;/span&gt;
+        &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setPath&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;serverPath&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//服务端路径&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;acl&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;acl&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;size&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;KeeperException&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;InvalidACLException&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setAcl&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;acl&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//acl控制权限&lt;/span&gt;
+        &lt;span class='n'&gt;ReplyHeader&lt;/span&gt; &lt;span class='n'&gt;r&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;cnxn&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;submitRequest&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;response&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//利用cnxn提交请求&lt;/span&gt;
+
+	
+    	&lt;span class='kd'&gt;public&lt;/span&gt; &lt;span class='n'&gt;ReplyHeader&lt;/span&gt; &lt;span class='nf'&gt;submitRequest&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;RequestHeader&lt;/span&gt; &lt;span class='n'&gt;h&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;Record&lt;/span&gt; &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+            &lt;span class='n'&gt;Record&lt;/span&gt; &lt;span class='n'&gt;response&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;WatchRegistration&lt;/span&gt; &lt;span class='n'&gt;watchRegistration&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;InterruptedException&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        	&lt;span class='n'&gt;ReplyHeader&lt;/span&gt; &lt;span class='n'&gt;r&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;ReplyHeader&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//返回的头消息封装&lt;/span&gt;
+	        &lt;span class='n'&gt;Packet&lt;/span&gt; &lt;span class='n'&gt;packet&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;queuePacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;r&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;request&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;response&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                    &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;watchRegistration&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//封装好发送的Packet,往OutgoingQueue提交等待处理&lt;/span&gt;
+        	&lt;span class='kd'&gt;synchronized&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+	            &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;finished&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//调用函数等待直到服务端响应消息完成&lt;/span&gt;
+        	        &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;wait&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+	            &lt;span class='o'&gt;}&lt;/span&gt;
+	        &lt;span class='o'&gt;}&lt;/span&gt;
+        	&lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;r&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+	    &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;接着进入上边sengThread提到的轮循处理的过程，待管道读到服务端的响应后进入sendThread.readResponse(incomingBuffer)方法，完成消息的响应的处理过程&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;	
+	&lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;readResponse&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;ByteBuffer&lt;/span&gt; &lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='kd'&gt;throws&lt;/span&gt; &lt;span class='n'&gt;IOException&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        
+	    &lt;span class='n'&gt;ByteBufferInputStream&lt;/span&gt; &lt;span class='n'&gt;bbis&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;ByteBufferInputStream&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                    &lt;span class='n'&gt;incomingBuffer&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='n'&gt;BinaryInputArchive&lt;/span&gt; &lt;span class='n'&gt;bbia&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;BinaryInputArchive&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getArchive&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;bbis&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='n'&gt;ReplyHeader&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;ReplyHeader&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;deserialize&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;bbia&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='s'&gt;&amp;quot;header&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//反序列化得到返回的头消息&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='mi'&gt;2&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='c1'&gt;// -2 is the xid for pings&lt;/span&gt;
+		&lt;span class='c1'&gt;//-2 表示ping的消息回馈，再debug的情况下记录日志然后返回不进行其他操作&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='mi'&gt;4&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='c1'&gt;// -4 is the xid for AuthPacket               &lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='n'&gt;KeeperException&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;Code&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;AUTHFAILED&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;intValue&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;state&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;States&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;AUTH_FAILED&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//向waittingQueue丢入授权失败的event                 &lt;/span&gt;
+                    &lt;span class='n'&gt;eventThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;queueEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;WatchedEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Watcher&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;Event&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;EventType&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;None&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; 
+                            &lt;span class='n'&gt;Watcher&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;Event&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;KeeperState&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;AuthFailed&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//将会从WathcerManager中得到所有的wathch进行处理      		            		&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='c1'&gt;// -1 means notification&lt;/span&gt;
+                &lt;span class='n'&gt;WatcherEvent&lt;/span&gt; &lt;span class='n'&gt;event&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;WatcherEvent&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                &lt;span class='n'&gt;event&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;deserialize&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;bbia&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='s'&gt;&amp;quot;response&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+		&lt;span class='o'&gt;...&lt;/span&gt;
+                &lt;span class='n'&gt;WatchedEvent&lt;/span&gt; &lt;span class='n'&gt;we&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;WatchedEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;event&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                &lt;span class='n'&gt;eventThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;queueEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt; &lt;span class='n'&gt;we&lt;/span&gt; &lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//该方法会从WatcherManager中得到所管理的响应的event&lt;/span&gt;
+					       &lt;span class='c1'&gt;//然后将event封装成WatcherSetEventPair丢入waittingQueue中等待EventThread的处理&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+	   &lt;span class='o'&gt;...&lt;/span&gt;
+
+            &lt;span class='n'&gt;Packet&lt;/span&gt; &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='kd'&gt;synchronized&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;size&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;IOException&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Nothing in the queue, but got &amp;quot;&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='n'&gt;packet&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;pendingQueue&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;remove&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//从pendingQueue中移除等待响应的Packet&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='cm'&gt;/*&lt;/span&gt;
+&lt;span class='cm'&gt;             * Since requests are processed in order, we better get a response&lt;/span&gt;
+&lt;span class='cm'&gt;             * to the first request!&lt;/span&gt;
+&lt;span class='cm'&gt;             */&lt;/span&gt;
+            &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;())&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//当请求的xid与服务端的xid不相等时,标识错误,抛出失去连接的错误&lt;/span&gt;
+                    &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setErr&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;
+                            &lt;span class='n'&gt;KeeperException&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;Code&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;CONNECTIONLOSS&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;intValue&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                    &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;IOException&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Xid out of order. Got Xid &amp;quot;&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='s'&gt;&amp;quot; with err &amp;quot;&lt;/span&gt; &lt;span class='o'&gt;+&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;+&lt;/span&gt;
+                            &lt;span class='s'&gt;&amp;quot; expected Xid &amp;quot;&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;requestHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='s'&gt;&amp;quot; for a packet with details: &amp;quot;&lt;/span&gt;
+                            &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='n'&gt;packet&lt;/span&gt; &lt;span class='o'&gt;);&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+
+                &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setXid&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getXid&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt; &lt;span class='c1'&gt;//将返回的头消息放回等待的packet中&lt;/span&gt;
+                &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setErr&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;setZxid&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getZxid&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getZxid&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;lastZxid&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getZxid&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//更新最后的lastZxid&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;replyHdr&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;deserialize&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;bbia&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='s'&gt;&amp;quot;response&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;finally&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;finishPacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;packet&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//调用该函数完成packet的最后一个步骤&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+
+    &lt;span class='kd'&gt;private&lt;/span&gt; &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;finishPacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;watchRegistration&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;watchRegistration&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;register&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt; &lt;span class='c1'&gt;//当返回的消息正确的情况下将watch放入WatcherManager中&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;cb&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  &lt;span class='c1'&gt;//如果Packet未设置回调函数则标识完成通知等待的线程&lt;/span&gt;
+            &lt;span class='kd'&gt;synchronized&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;finished&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='kc'&gt;true&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; 
+                &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;notifyAll&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;finished&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='kc'&gt;true&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//标识完成&lt;/span&gt;
+            &lt;span class='n'&gt;eventThread&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;queuePacket&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;//将packet丢入waittingQueue中等待EventThread调用相应的回调方法&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;	
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;最后在看一下EventThread对waittingQueue所做的操作&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;     &lt;span class='kd'&gt;private&lt;/span&gt; &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;processEvent&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Object&lt;/span&gt; &lt;span class='n'&gt;event&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+          &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+              &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;event&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;WatcherSetEventPair&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;   &lt;span class='c1'&gt;//对于event的操作根据类型分为两类&lt;/span&gt;
+							&lt;span class='c1'&gt;//第一是先前封装的WatcherSetEvetnPair针对返回的头消息是-4和-1所做的操作&lt;/span&gt;
+						        &lt;span class='c1'&gt;//根据返回的WatchManager所管理的Watch分别调用各自的process函数处理&lt;/span&gt;
+                  &lt;span class='n'&gt;WatcherSetEventPair&lt;/span&gt; &lt;span class='n'&gt;pair&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;WatcherSetEventPair&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;event&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                  &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Watcher&lt;/span&gt; &lt;span class='n'&gt;watcher&lt;/span&gt; &lt;span class='o'&gt;:&lt;/span&gt; &lt;span class='n'&gt;pair&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;watchers&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                      &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                          &lt;span class='n'&gt;watcher&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;process&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;pair&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;event&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                      &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;catch&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Throwable&lt;/span&gt; &lt;span class='n'&gt;t&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                          &lt;span class='n'&gt;LOG&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;error&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Error while calling watcher &amp;quot;&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;t&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                      &lt;span class='o'&gt;}&lt;/span&gt;
+                  &lt;span class='o'&gt;}&lt;/span&gt;
+              &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;  
+                  &lt;span class='c1'&gt;//第二种是包含cb所进行的回调处理&lt;/span&gt;
+                  &lt;span class='c1'&gt;//根据Packet中设置的返回消息回调类型通过cb来完成&lt;/span&gt;
+                  &lt;span class='n'&gt;Packet&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Packet&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;event&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                  &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;rc&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                  &lt;span class='n'&gt;String&lt;/span&gt; &lt;span class='n'&gt;clientPath&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;clientPath&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                  &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                      &lt;span class='n'&gt;rc&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;replyHeader&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getErr&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+                  &lt;span class='o'&gt;}&lt;/span&gt;
+                  &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;cb&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                      &lt;span class='n'&gt;LOG&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;warn&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Somehow a null cb got to EventThread!&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                  &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;ExistsResponse&lt;/span&gt;
+                          &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;SetDataResponse&lt;/span&gt;
+                          &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;SetACLResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                      &lt;span class='n'&gt;StatCallback&lt;/span&gt; &lt;span class='n'&gt;cb&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;StatCallback&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;cb&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                      &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                          &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;ExistsResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                              &lt;span class='n'&gt;cb&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;processResult&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;clientPath&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ctx&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                                      &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;ExistsResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                                              &lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getStat&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                          &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;SetDataResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                              &lt;span class='n'&gt;cb&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;processResult&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;clientPath&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ctx&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                                      &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;SetDataResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                                              &lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getStat&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                          &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt; &lt;span class='k'&gt;instanceof&lt;/span&gt; &lt;span class='n'&gt;SetACLResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                              &lt;span class='n'&gt;cb&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;processResult&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;clientPath&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ctx&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;
+                                      &lt;span class='o'&gt;((&lt;/span&gt;&lt;span class='n'&gt;SetACLResponse&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;response&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                                              &lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;getStat&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;
+                          &lt;span class='o'&gt;}&lt;/span&gt;
+                      &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                          &lt;span class='n'&gt;cb&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;processResult&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;rc&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;clientPath&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;ctx&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                      &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='o'&gt;...&lt;/span&gt;
+              &lt;span class='o'&gt;}&lt;/span&gt;
+          &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;catch&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Throwable&lt;/span&gt; &lt;span class='n'&gt;t&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+              &lt;span class='n'&gt;LOG&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;error&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;Caught unexpected throwable&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;t&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+          &lt;span class='o'&gt;}&lt;/span&gt;
+       &lt;span class='o'&gt;}&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;针对Zookeeper客户端的实现逻辑和主要代码段介绍完了,看似简单但真正把代码都介绍完才慢慢体会到里边很多的细节,也算是真正意义上的看懂了,总觉着这篇文章的代码贴的太多,看得不是很舒服,下篇介绍Zookeeper实现的方式看看是否能换一种更好的方式写出来,很多事总要经历那么一个过程&amp;#8230;&lt;/p&gt;
+
+&lt;p&gt;相关链接&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://www.spnguru.com/2010/08/zookeeper%E5%85%A8%E8%A7%A3%E6%9E%90%E2%80%94%E2%80%94client%E7%AB%AF/'&gt;Zookeeper全解析——Client端&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://book.douban.com/subject/1433583/'&gt;Java NIO&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://book.douban.com/subject/1438754/'&gt;Java网络编程&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://log.adamwilcox.org/2013/03/25/fixing-soundcloud-embeds-on-github-pages-jekyll/'&gt;Jekyll中引入iframe的问题&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;</description>
+				<pubDate>Thu, 31 Oct 2013 21:50:16 +0800</pubDate>
+				<link>http://2375.me//2013/10/31/Zookeeper-Client-Implementation-Analysis.html</link>
+				<guid isPermaLink="true">http://2375.me//2013/10/31/Zookeeper-Client-Implementation-Analysis.html</guid>
+			</item>
+		
+			<item>
+				<title>Java并发编程ConcurrentHashMap</title>
+				<description>&lt;p&gt;相对于线程不安全的HashMap来说,HashTable在存储table&lt;span /&gt;数组操作方法上的粗粒度synchronized则对性能损耗太多,先看看下面性能对比情况下(数值表示运行花费的毫秒数):&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;   &lt;span class='n'&gt;Thread&lt;/span&gt; &lt;span class='n'&gt;number&lt;/span&gt;      &lt;span class='n'&gt;HashTable&lt;/span&gt;          &lt;span class='n'&gt;ConcurrentHashMap&lt;/span&gt;
+      &lt;span class='mi'&gt;1&lt;/span&gt;                  &lt;span class='mi'&gt;19&lt;/span&gt;                     &lt;span class='mi'&gt;20&lt;/span&gt;
+      &lt;span class='mi'&gt;2&lt;/span&gt;                  &lt;span class='mi'&gt;32&lt;/span&gt;                     &lt;span class='mi'&gt;27&lt;/span&gt;
+      &lt;span class='mi'&gt;10&lt;/span&gt;                 &lt;span class='mi'&gt;131&lt;/span&gt;                    &lt;span class='mi'&gt;110&lt;/span&gt;
+      &lt;span class='mi'&gt;40&lt;/span&gt;                 &lt;span class='mi'&gt;68&lt;/span&gt;                     &lt;span class='mi'&gt;264&lt;/span&gt;
+      &lt;span class='mi'&gt;100&lt;/span&gt;                &lt;span class='mi'&gt;124&lt;/span&gt;                    &lt;span class='mi'&gt;646&lt;/span&gt;
+      &lt;span class='mi'&gt;200&lt;/span&gt;                &lt;span class='mi'&gt;1318&lt;/span&gt;                   &lt;span class='mi'&gt;247&lt;/span&gt;      
+      &lt;span class='mi'&gt;500&lt;/span&gt;                &lt;span class='mi'&gt;3244&lt;/span&gt;                   &lt;span class='mi'&gt;673&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;测试代码的逻辑是一个map实例,每个并发的线程进行10,000次的随机put或者get的时间消耗&lt;/p&gt;
+
+&lt;p&gt;&lt;code&gt;HashTable&lt;/code&gt;通过synchronized实现table&lt;span /&gt;的线程安全,方法上粗力度的加锁实现方式,限制了table&lt;span /&gt;数组的操作上同个时间段都将被一个线程独占,其他并发的线程只能等待或轮循,所以HashTable的伸缩性较差,即使在系统的资源充足的情况下也无法通过更多的cpu线程占用率来提高Hashtable的性能,在读多写少的特定场景下性能更是较HashTable有更大的差距.HashTable在Iterator并不保证table中数据的一致性,迭代的过程中并未锁住table&lt;span /&gt;,采用了fast fail的方式验证mod的值是否和expectedModCount值相等,若不等抛出ConcurrentModificationException,在并发的环境下同时进行迭代和put或delete很容易抛出该异常&lt;/p&gt;
+
+&lt;p&gt;&lt;code&gt;ConcourrentHashMap&lt;/code&gt;在锁的设计上进行了优化,设计了多组的分段锁,不同于HashTable的独占锁,ConcurrentHashMap采用了Segment数组的数据结构,每个Segment对应一个分段锁,其实在设计上每个Segment都相当于一个HashTable,简单的说就是一个ConcurrentHashMap的存储对应多个Segment数组(类似HashTable),每次必要的锁操作只对应到单个Segment,并不会锁住这个ConcurrentHashMap实例&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;  
+ &lt;span class='n'&gt;ConcurrentHashMap&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;        &lt;span class='c1'&gt;//默认的构造方法&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='mi'&gt;16&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='mf'&gt;0.75f&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='mi'&gt;16&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+
+ &lt;span class='kd'&gt;public&lt;/span&gt; &lt;span class='nf'&gt;ConcurrentHashMap&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;initialCapacity&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;float&lt;/span&gt; &lt;span class='n'&gt;loadFactor&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;concurrencyLevel&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!(&lt;/span&gt;&lt;span class='n'&gt;loadFactor&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='n'&gt;initialCapacity&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='n'&gt;concurrencyLevel&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;IllegalArgumentException&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;concurrencyLevel&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;MAX_SEGMENTS&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='n'&gt;concurrencyLevel&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;MAX_SEGMENTS&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//MAX_SEGMENTS = 1 &amp;lt;&amp;lt; 16  所以concurrencyLevel的值最大为65535&lt;/span&gt;
+
+        &lt;span class='c1'&gt;// Find power-of-two sizes best matching arguments&lt;/span&gt;
+        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;sshift&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;ssize&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;ssize&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='n'&gt;concurrencyLevel&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='o'&gt;++&lt;/span&gt;&lt;span class='n'&gt;sshift&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;       &lt;span class='c1'&gt;//偏移量&lt;/span&gt;
+            &lt;span class='n'&gt;ssize&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;=&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//ssize恰好大于或等于concurrencyLevel,且为2的整数倍,即Segment的数组大小&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='n'&gt;segmentShift&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;32&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='n'&gt;sshift&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//32与sshift的差值,用于segment的定位,下文会提到&lt;/span&gt;
+        &lt;span class='n'&gt;segmentMask&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;ssize&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;    &lt;span class='c1'&gt;//比Segment数组长度小1的掩码,应该用于求余&lt;/span&gt;
+        &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;segments&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;Segment&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;newArray&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;ssize&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//创建ssize大小的数组&lt;/span&gt;
+
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;initialCapacity&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;MAXIMUM_CAPACITY&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='n'&gt;initialCapacity&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;MAXIMUM_CAPACITY&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  &lt;span class='c1'&gt;//ConcurrentHashMap的每个Segment能够存储的最大值  MAXIMUM_CAPACITY = 1 &amp;lt;&amp;lt; 30; &lt;/span&gt;
+        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;initialCapacity&lt;/span&gt; &lt;span class='o'&gt;/&lt;/span&gt; &lt;span class='n'&gt;ssize&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;           
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;c&lt;/span&gt; &lt;span class='o'&gt;*&lt;/span&gt; &lt;span class='n'&gt;ssize&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='n'&gt;initialCapacity&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='o'&gt;++&lt;/span&gt;&lt;span class='n'&gt;c&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//调整c的值恰好为ssize*C &amp;gt;initialCapacity的条件下的最小值&lt;/span&gt;
+        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;cap&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;cap&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='n'&gt;cap&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;=&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//cap为略大于c的2的倍数&lt;/span&gt;
+
+        &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;segments&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='o'&gt;++&lt;/span&gt;&lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;segments&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;Segment&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;(&lt;/span&gt;&lt;span class='n'&gt;cap&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;loadFactor&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;    &lt;span class='c1'&gt;//初始化Segment数组,初始大小为cap&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+
+
+    &lt;span class='kd'&gt;static&lt;/span&gt; &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='kd'&gt;class&lt;/span&gt; &lt;span class='nc'&gt;Segment&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='kd'&gt;extends&lt;/span&gt; &lt;span class='n'&gt;ReentrantLock&lt;/span&gt; &lt;span class='kd'&gt;implements&lt;/span&gt; &lt;span class='n'&gt;Serializable&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+
+        &lt;span class='kd'&gt;transient&lt;/span&gt; &lt;span class='kd'&gt;volatile&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;count&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+        &lt;span class='kd'&gt;transient&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;modCount&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+        &lt;span class='kd'&gt;transient&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;threshold&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+        &lt;span class='kd'&gt;transient&lt;/span&gt; &lt;span class='kd'&gt;volatile&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;table&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;    &lt;span class='c1'&gt;//和hashtable结构类似,存放Entry的table&lt;/span&gt;
+
+        &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='kt'&gt;float&lt;/span&gt; &lt;span class='n'&gt;loadFactor&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='o'&gt;.....&lt;/span&gt;
+  &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;ConcurrentHashMap初始化即通过一系列参数调整设置Segment的大小,ConcurrentHashMap维护了power of 2的Segment的数组.&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;   
+   &lt;span class='kd'&gt;public&lt;/span&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='nf'&gt;put&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;value&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+            &lt;span class='k'&gt;throw&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='nf'&gt;NullPointerException&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hashCode&lt;/span&gt;&lt;span class='o'&gt;());&lt;/span&gt;   &lt;span class='c1'&gt;//第一次hash&lt;/span&gt;
+        &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='nf'&gt;segmentFor&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;).&lt;/span&gt;&lt;span class='na'&gt;put&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kc'&gt;false&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+   
+   &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='n'&gt;Segment&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;segmentFor&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+        &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;segments&lt;/span&gt;&lt;span class='o'&gt;[(&lt;/span&gt;&lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;segmentShift&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;segmentMask&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+   	
+   &lt;span class='kd'&gt;private&lt;/span&gt; &lt;span class='kd'&gt;static&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='nf'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;h&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; 
+        &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;+=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;&lt;/span&gt;  &lt;span class='mi'&gt;15&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;^&lt;/span&gt; &lt;span class='mh'&gt;0xffffcd7d&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;^=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class='mi'&gt;10&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;+=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;&lt;/span&gt;   &lt;span class='mi'&gt;3&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;^=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt;  &lt;span class='mi'&gt;6&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;+=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;&lt;/span&gt;   &lt;span class='mi'&gt;2&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;+&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&amp;lt;&lt;/span&gt; &lt;span class='mi'&gt;14&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+        &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;^&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;h&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class='mi'&gt;16&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;ConcurrentHashMap的put操作,其中hash()函数的作用是根据不同的key计算散列码(数学问题)目的是使数据通过hash值&amp;amp;mask数组大小达到数据均匀分配到Entry数组上的目的,segments()通过hash的值定位数据到一个确定的Segment上,通过Segments可以确定ConcurrentHashMap的Segments数组大小在实例初始化后就已经确定的不允许扩充的,所以segment数组,segmentMask和segmentShift属性都是final的.&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='nf'&gt;put&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;boolean&lt;/span&gt; &lt;span class='n'&gt;onlyIfAbsent&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;lock&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;  &lt;span class='c1'&gt;//获得当前Segment的锁对象&lt;/span&gt;
+            &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;count&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;c&lt;/span&gt;&lt;span class='o'&gt;++&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;threshold&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;     &lt;span class='c1'&gt;// ensure capacity&lt;/span&gt;
+                    &lt;span class='n'&gt;rehash&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;          &lt;span class='c1'&gt;//大小大于当前阀值,扩充Entry[]数组的大小&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;table&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;index&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//hash值定位到一个slot&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;index&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='o'&gt;!&lt;/span&gt;&lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;equals&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt;&lt;span class='o'&gt;)))&lt;/span&gt;
+                    &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//查找当前slot的链表中是否存在当前插入key&lt;/span&gt;
+
+                &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;oldValue&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;    &lt;span class='c1'&gt;//存在的条件下&lt;/span&gt;
+                    &lt;span class='n'&gt;oldValue&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; 
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(!&lt;/span&gt;&lt;span class='n'&gt;onlyIfAbsent&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;    
+                        &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;//在onlyIfAbsent为true,即不存在key的情况下才插入&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;oldValue&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//不存在的条件下&lt;/span&gt;
+                    &lt;span class='o'&gt;++&lt;/span&gt;&lt;span class='n'&gt;modCount&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                    &lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;index&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;(&lt;/span&gt;&lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//采用头插法插入新key&lt;/span&gt;
+                    &lt;span class='n'&gt;count&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;// write-volatile&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;oldValue&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;finally&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;unlock&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt; &lt;span class='c1'&gt;//释放当前锁对象&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;Segment插入类似于HashTable的put获得锁的情况下进行操作,最大的不同是HashTable要获得当前实例的全局锁,阻塞其他线程对实例的syn操作,而ConcuurentHashMap采用了分段的锁机制,当前获得的锁只是阻塞了其对应的Segment,而相对其他的ssize-1的Segments并无影响,分段锁达到了细粒化锁的目的.多消耗的仅是segment()定位segment的操作&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;     &lt;span class='kd'&gt;static&lt;/span&gt; &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='kd'&gt;class&lt;/span&gt; &lt;span class='nc'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;      &lt;span class='c1'&gt;//Entry的实现类&lt;/span&gt;
+        &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='n'&gt;K&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;    &lt;span class='c1'&gt;//一个Entry的实例变量的key是永久不变的,推之hash也是final&lt;/span&gt;
+        &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='kd'&gt;volatile&lt;/span&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//对于多线程的更改操作即保证值更改的立即可见性&lt;/span&gt;
+        &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;   &lt;span class='c1'&gt;//修饰符为final决定了next的不变性,所以链表中的删除和rehash的过程都要重新build之前的所有e节点&lt;/span&gt;
+                                          
+        &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;next&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='k'&gt;this&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+
+	&lt;span class='nd'&gt;@SuppressWarnings&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='s'&gt;&amp;quot;unchecked&amp;quot;&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+	&lt;span class='kd'&gt;static&lt;/span&gt; &lt;span class='kd'&gt;final&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;newArray&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+	    &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;
+	&lt;span class='o'&gt;}&lt;/span&gt;
+    &lt;span class='o'&gt;}&lt;/span&gt;
+
+     &lt;span class='kt'&gt;void&lt;/span&gt; &lt;span class='nf'&gt;rehash&lt;/span&gt;&lt;span class='o'&gt;()&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;   
+            &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;oldTable&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;table&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;oldCapacity&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;oldTable&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;oldCapacity&lt;/span&gt; &lt;span class='o'&gt;&amp;gt;=&lt;/span&gt; &lt;span class='n'&gt;MAXIMUM_CAPACITY&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;   &lt;span class='c1'&gt;//每个Segment的最大值为 1 &amp;gt;&amp;gt; 32&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+            &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;newTable&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;newArray&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;oldCapacity&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&amp;lt;&lt;/span&gt;&lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;   &lt;span class='c1'&gt;//新开辟2倍的oldCapacity&lt;/span&gt;
+            &lt;span class='n'&gt;threshold&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt;&lt;span class='o'&gt;)(&lt;/span&gt;&lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt; &lt;span class='o'&gt;*&lt;/span&gt; &lt;span class='n'&gt;loadFactor&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+            &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;sizeMask&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;    &lt;span class='c1'&gt;//新数组长度的掩码&lt;/span&gt;
+            &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt; &lt;span class='o'&gt;&amp;lt;&lt;/span&gt; &lt;span class='n'&gt;oldCapacity&lt;/span&gt; &lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;++)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='c1'&gt;// We need to guarantee that any existing reads of old Map can&lt;/span&gt;
+                &lt;span class='c1'&gt;//  proceed. So we cannot yet null out each bin.&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;oldTable&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;i&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;
+
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;next&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                    &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;idx&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;sizeMask&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+
+                    &lt;span class='c1'&gt;//  Single node on list&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;next&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                        &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;idx&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;  
+       &lt;span class='c1'&gt;//next节点为null保证了hash值到这个槽位的值仅此一家,别无分店,所有直接对应到newTable数组的idx的&lt;/span&gt;
+      &lt;span class='c1'&gt;//槽位上,细想想,每个key的hash值是和掩码即数组长度在只有一家的情况下在扩容后同样也不会出现第二个和它冲突的key&lt;/span&gt;
+                    &lt;span class='k'&gt;else&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='c1'&gt;// Reuse trailing consecutive sequence at same slot&lt;/span&gt;
+                        &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;lastRun&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;      
+                        &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;lastIdx&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;idx&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;     &lt;span class='c1'&gt;//rehash的算法有点小技巧&lt;/span&gt;
+                        &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;last&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;        
+                             &lt;span class='n'&gt;last&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                             &lt;span class='n'&gt;last&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;last&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                            &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;k&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;last&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;sizeMask&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;k&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;lastIdx&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                                &lt;span class='n'&gt;lastIdx&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;      &lt;span class='c1'&gt;//算出old链表下最后一个key在新sizemask下不同的Idx值&lt;/span&gt;
+                                &lt;span class='n'&gt;lastRun&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;last&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                        &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;lastIdx&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;lastRun&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='c1'&gt;// Clone all remaining nodes&lt;/span&gt;
+                        &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;lastRun&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;   
+                           &lt;span class='c1'&gt;//只用重新new lastRun之前的节点,而在lastRun之后的节点因为会定位到同一个Idx上所以直接由lastRun带过去就可以了&lt;/span&gt;
+                            &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;k&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;sizeMask&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                            &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;n&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;   &lt;span class='c1'&gt;//采用头插入法&lt;/span&gt;
+                            &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;k&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;n&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                        &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='n'&gt;table&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;newTable&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;    
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;rehash是在拿到lock的情况下进行的,对于旧的oldTable不存在更改的情况,对于无锁的get的操作来说,只是happen before的关系,不影响读取,注意Concurrent不存在hashmap中并发rehash导致的死锁问题&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt; 	
+    &lt;span class='c1'&gt;//Remove; match on key only if value null, else match both.&lt;/span&gt;
+        &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='nf'&gt;remove&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Object&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;Object&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;lock&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='k'&gt;try&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;count&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;table&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;index&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;index&lt;/span&gt;&lt;span class='o'&gt;];&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='o'&gt;!&lt;/span&gt;&lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;equals&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt;&lt;span class='o'&gt;)))&lt;/span&gt;
+                    &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;oldValue&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;v&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;value&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt; &lt;span class='o'&gt;||&lt;/span&gt; &lt;span class='n'&gt;value&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;equals&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;v&lt;/span&gt;&lt;span class='o'&gt;))&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='n'&gt;oldValue&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;v&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='c1'&gt;// All entries following removed node can stay&lt;/span&gt;
+                        &lt;span class='c1'&gt;// in list, but all preceding ones need to be&lt;/span&gt;
+                        &lt;span class='c1'&gt;// cloned.&lt;/span&gt;
+                        &lt;span class='o'&gt;++&lt;/span&gt;&lt;span class='n'&gt;modCount&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;newFirst&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='k'&gt;for&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;first&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                            &lt;span class='n'&gt;newFirst&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='k'&gt;new&lt;/span&gt; &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;(&lt;/span&gt;&lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;newFirst&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='n'&gt;p&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;
+                        &lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;index&lt;/span&gt;&lt;span class='o'&gt;]&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;newFirst&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='n'&gt;count&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;c&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt; &lt;span class='c1'&gt;// write-volatile&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+                &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;oldValue&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt; &lt;span class='k'&gt;finally&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                &lt;span class='n'&gt;unlock&lt;/span&gt;&lt;span class='o'&gt;();&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;remove的操作其实和rehash有些相似的地方,对于next的修饰符是final,所以对于remove之前的所有节点都需要重新build.&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='java'&gt;         &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='nf'&gt;get&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;Object&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt; &lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;count&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt; &lt;span class='c1'&gt;// read-volatile&lt;/span&gt;
+                &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;getFirst&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt;  &lt;span class='c1'&gt;//getFirst利用hash值返回key所落在的槽位&lt;/span&gt;
+                &lt;span class='k'&gt;while&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                    &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;==&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class='n'&gt;key&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;equals&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;key&lt;/span&gt;&lt;span class='o'&gt;))&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+                        &lt;span class='n'&gt;V&lt;/span&gt; &lt;span class='n'&gt;v&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;value&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='k'&gt;if&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;v&lt;/span&gt; &lt;span class='o'&gt;!=&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt;
+                            &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;v&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                        &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='nf'&gt;readValueUnderLock&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;);&lt;/span&gt; &lt;span class='c1'&gt;// recheck&lt;/span&gt;
+                    &lt;span class='o'&gt;}&lt;/span&gt;
+                    &lt;span class='n'&gt;e&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;e&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;next&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+                &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='o'&gt;}&lt;/span&gt;
+            &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='kc'&gt;null&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+      &lt;span class='o'&gt;}&lt;/span&gt;
+
+    &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;&lt;/span&gt; &lt;span class='n'&gt;getFirst&lt;/span&gt;&lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='kt'&gt;int&lt;/span&gt; &lt;span class='n'&gt;hash&lt;/span&gt;&lt;span class='o'&gt;)&lt;/span&gt; &lt;span class='o'&gt;{&lt;/span&gt;
+            &lt;span class='n'&gt;HashEntry&lt;/span&gt;&lt;span class='o'&gt;&amp;lt;&lt;/span&gt;&lt;span class='n'&gt;K&lt;/span&gt;&lt;span class='o'&gt;,&lt;/span&gt;&lt;span class='n'&gt;V&lt;/span&gt;&lt;span class='o'&gt;&amp;gt;[]&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt; &lt;span class='o'&gt;=&lt;/span&gt; &lt;span class='n'&gt;table&lt;/span&gt;&lt;span class='o'&gt;;&lt;/span&gt;
+            &lt;span class='k'&gt;return&lt;/span&gt; &lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;[&lt;/span&gt;&lt;span class='n'&gt;hash&lt;/span&gt; &lt;span class='o'&gt;&amp;amp;&lt;/span&gt; &lt;span class='o'&gt;(&lt;/span&gt;&lt;span class='n'&gt;tab&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='na'&gt;length&lt;/span&gt; &lt;span class='o'&gt;-&lt;/span&gt; &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;)];&lt;/span&gt;
+        &lt;span class='o'&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;p&gt;get并不需要加锁,why?首先value的属性通过voliate修饰,轻量级的锁,若任何线程对v的修改,则get的操作会立即从main memory看到此改变.其次,&lt;code&gt;v != null&lt;/code&gt;的判断,ConcurrentHashMap的put入口是不允许有null的value的值,那在segment的get内部实现中,为什么还要多此一举的判断?这是因为线程B进行put(key)的操作和线程A读取(key)的操作不存在happen before的关系,所以读到的可能为工作线程memory里的null值,当然这重情况出现的概率很小很小很小,所以防止出现这种情况,利用加锁强制刷新读取e的值.&lt;/p&gt;
+
+&lt;p&gt;ConcurrentHashMap不是绝对意义上的put和get等操作的线程安全,但它在并发的性能和数据缓存一致性方面是个很好的实现方式,数据绝对的一致性还是要用collections.synChronizedMap方法实现.它的实质是在hashMap上封装了一层synchronized的代理.效率和HashTable是差不多的.&lt;/p&gt;
+
+&lt;p&gt;相关文章&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://www.infoq.com/cn/articles/ConcurrentHashMap'&gt;聊聊并发（四）——深入分析ConcurrentHashMap&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://coolshell.cn/articles/9606.html'&gt;疫苗：Java HashMap的死循环&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://www.iteye.com/topic/260515/'&gt;用happen-before规则重新审视DCL&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html'&gt;The &amp;#8220;Double-Checked Locking is Broken&amp;#8221; Declaration&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;</description>
+				<pubDate>Sun, 21 Jul 2013 22:43:50 +0800</pubDate>
+				<link>http://2375.me//2013/07/21/Java-ConcurrentHashMap.html</link>
+				<guid isPermaLink="true">http://2375.me//2013/07/21/Java-ConcurrentHashMap.html</guid>
+			</item>
+		
+			<item>
+				<title>Linux 性能监控实践[1]</title>
+				<description>&lt;p&gt;搞Hadoop仅依靠ganglia或其他监控管理工具是远远不够的,真正了解熟悉各种mstat,nload,top等才靠谱,所以写篇linux的性能监控方面的文章搞清各个监控命令的细枝末节&lt;/p&gt;
+
+&lt;h3 id='_free'&gt;内存 free&lt;/h3&gt;
+
+&lt;p&gt;&lt;code&gt;free&lt;/code&gt;显示系统内存当前空闲和占用量以及swap内存交换使用情况,free实质是显示/proc/meminfo的格式化信息&lt;/p&gt;
+
+&lt;p&gt;&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='ruby'&gt;&lt;span class='n'&gt;ly&lt;/span&gt;&lt;span class='vi'&gt;@ly&lt;/span&gt;&lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='no'&gt;Latitude&lt;/span&gt;&lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='ss'&gt;E5400&lt;/span&gt;&lt;span class='p'&gt;:&lt;/span&gt;&lt;span class='o'&gt;~&lt;/span&gt;&lt;span class='err'&gt;$&lt;/span&gt; &lt;span class='n'&gt;free&lt;/span&gt;
+                     &lt;span class='n'&gt;total&lt;/span&gt;      &lt;span class='n'&gt;used&lt;/span&gt;      &lt;span class='n'&gt;free&lt;/span&gt;      &lt;span class='n'&gt;shared&lt;/span&gt;  &lt;span class='n'&gt;buffers&lt;/span&gt;   &lt;span class='n'&gt;cached&lt;/span&gt;
+&lt;span class='ss'&gt;Mem&lt;/span&gt;&lt;span class='p'&gt;:&lt;/span&gt;                 &lt;span class='mi'&gt;3089212&lt;/span&gt;    &lt;span class='mi'&gt;2049072&lt;/span&gt;   &lt;span class='mi'&gt;1040140&lt;/span&gt;   &lt;span class='mi'&gt;0&lt;/span&gt;       &lt;span class='mi'&gt;13784&lt;/span&gt;     &lt;span class='mi'&gt;1231952&lt;/span&gt;
+&lt;span class='o'&gt;-/+&lt;/span&gt; &lt;span class='n'&gt;buffers&lt;/span&gt;&lt;span class='o'&gt;/&lt;/span&gt;&lt;span class='ss'&gt;cache&lt;/span&gt;&lt;span class='p'&gt;:&lt;/span&gt;   &lt;span class='mi'&gt;803336&lt;/span&gt;     &lt;span class='mi'&gt;2285876&lt;/span&gt;     
+&lt;span class='ss'&gt;Swap&lt;/span&gt;&lt;span class='p'&gt;:&lt;/span&gt;                &lt;span class='mi'&gt;3134460&lt;/span&gt;    &lt;span class='mi'&gt;7488&lt;/span&gt;      &lt;span class='mi'&gt;3126972&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/p&gt;
+
+&lt;p&gt;free命令默认显示的是kilobytes字节的大小 &lt;code&gt;free -m&lt;/code&gt; 按照megabytes字节的大小显示&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;total 系统的总共内存大小(这里有个注意的地方,total的大小与机器实质配置的内存要略微小一点,这是因为kernel在启动时永久的占据了一部分内存的原因)&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;used 当前运行的application和os所占用的内存大小&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;free = total - used 系统空闲的内存大小&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;shared 已经deprecated了,指多个processes共享的内存大小&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;buffers 系统用于IO传输操作,例如数据等待写入磁盘&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;cached 最近使用的文件被cached在了内存中,所以application跑起来更快&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;要特别注意的是NR=1和NR=2的区别,Mem和-/+buffers/cache的区别在于buffers和cached的大小在Mem行被算入used中,而实质上buffers和cached所占用的内存是可被分配给系统新的应用需求,即可被剥夺的,所以-/+buffers/cache行才是系统&amp;#8217;实质&amp;#8217;的占用和空闲内存使用情况.ps:{Mem:total}={Mem:used}+{Mem:free}={-/+buffers/cache:used}+{-/+buffers/cached:free},Swap即内存不足时,系统将一部分内存交换写入disk中,当系统开始使用swap交换分区则说明系统负载过重,对于我们的集群应用来说是不可接受的&lt;/p&gt;
+
+&lt;p&gt;命令行参数简介:&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;-s {num} 以num秒的延迟持续刷新free的值&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-c {num} 和-s组合使用,限制刷新的次数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-l 统计Mem的最大值和最小值&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-o 仅显示Mem和Swap行&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-t 多输出了一行是Mem行和Swap的sum值&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;code&gt;free -m -s 2&lt;/code&gt; free以megabytes的大小显示内存,每2秒刷新一次&lt;/p&gt;
+
+&lt;p&gt;buffers和cached的大小你可以通过开多个虚拟机发现越变越小,当你立即释放虚拟机占据的内存后,buffers和cached的大小是伴着系统后续文件的使用逐渐增大的,猜想:buffers和cached内存占用的大小应该直接影响系统的性能,这部分内存占用越小系统的性能越低?&lt;/p&gt;
+
+&lt;h3 id='io_iostat'&gt;I/O iostat&lt;/h3&gt;
+
+&lt;p&gt;iostat是用来监测硬盘的读写速率,也就是IOPS.iostat report了三个方面的信息{cpu,device I/O,network},其中cpu和network的相关信息是和I/O操作相关的.iostat的report的原数据主要来自/proc/diskstats.先来看一下cpu方面的report信息&lt;/p&gt;
+&lt;div class='highlight'&gt;&lt;pre&gt;&lt;code class='ruby'&gt;&lt;span class='no'&gt;Linux&lt;/span&gt; &lt;span class='mi'&gt;2&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;6&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;32&lt;/span&gt;&lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='mi'&gt;279&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='n'&gt;el6&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='n'&gt;x86&lt;/span&gt; &lt;span class='n'&gt;_&lt;/span&gt; &lt;span class='mi'&gt;64&lt;/span&gt; &lt;span class='p'&gt;(&lt;/span&gt;&lt;span class='n'&gt;hostname&lt;/span&gt;&lt;span class='p'&gt;)&lt;/span&gt; 	&lt;span class='mo'&gt;07&lt;/span&gt;&lt;span class='o'&gt;/&lt;/span&gt;&lt;span class='mi'&gt;31&lt;/span&gt;&lt;span class='o'&gt;/&lt;/span&gt;&lt;span class='mi'&gt;2013&lt;/span&gt; 	&lt;span class='n'&gt;_x86_64&lt;/span&gt; &lt;span class='p'&gt;(&lt;/span&gt;&lt;span class='mi'&gt;24&lt;/span&gt; &lt;span class='no'&gt;CPU&lt;/span&gt;&lt;span class='p'&gt;)&lt;/span&gt;
+
+&lt;span class='n'&gt;avg&lt;/span&gt;&lt;span class='o'&gt;-&lt;/span&gt;&lt;span class='ss'&gt;cpu&lt;/span&gt;&lt;span class='p'&gt;:&lt;/span&gt;  &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='n'&gt;user&lt;/span&gt;   &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='n'&gt;nice&lt;/span&gt; &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='nb'&gt;system&lt;/span&gt; &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='n'&gt;iowait&lt;/span&gt;  &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='n'&gt;steal&lt;/span&gt;   &lt;span class='o'&gt;%&lt;/span&gt;&lt;span class='n'&gt;idle&lt;/span&gt;
+           &lt;span class='mi'&gt;2&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;61&lt;/span&gt;    &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mo'&gt;00&lt;/span&gt;    &lt;span class='mi'&gt;1&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;23&lt;/span&gt;    &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;42&lt;/span&gt;    &lt;span class='mi'&gt;0&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mo'&gt;00&lt;/span&gt;   &lt;span class='mi'&gt;95&lt;/span&gt;&lt;span class='o'&gt;.&lt;/span&gt;&lt;span class='mi'&gt;75&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;%user 用户级别的cpu占用率,就是应用的占用率&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%nice 用户级别的并且开始执行应用时指定了nice的优先级(priority)的cpu占用率&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%system 当然是系统级别的kernel的cpu占用率&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%iowait 硬盘的I/O很容易成为系统的瓶颈,此项目就显示了cpu在等待I/O操作所占的比重,我们当然希望这个值越低系统运行的越健康&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%steal 虚拟化的cpu等待的处理器服务于其他虚拟的cpu的时间.例如,虚拟的两个cpu Va和Vb, steal就是Va等待处理器被Vb占用的执行指令的时间.&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%idle 在没有磁盘I/O操作状态下CPU空闲的占用率信息&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;再来看一下iostat的主要作用监控磁盘设备的状态&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;tps 表示一秒钟内设备的传输次数,一次传输指的是一次设备上的I/O请求,多个逻辑上的I/O请求合并为一次I/O请求,一次I/O请求传输的大小不确定.&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;Blk_read/s(kB_read/s, MB_read/s) 每秒钟从设备读取的块的数量(kB或者MB),KB块的大小为扇区的大小,即512k&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;Blk_wrtn/s (kB_wrtn/s, MB_wrtn/s)每秒钟写入到设备的块的数量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;Blk_read(kB_read, MB_read) 读取块的总数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;Blk_wrtn(kB_wrtn, MB_wrtn) 写入块的总数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;rrqm/s 对于写队列中对相同的block的读取fileSystem会合并为一个读请求,rrqm/s表示的就是合并的个数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;wrqm/s 对于相同块的写入合并为一次写操作,wrqm/s表示的就是合并的写个数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;r/s 每秒完成的读操作次数(合并后的读操作)&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;w/s 每秒完成的写操作的次数(也是合并后的操作)&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;rsec/s (rkB/s, rMB/s) 每秒读的扇区的数量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;wsec/s (wkB/s, wMB/s) 每秒写的扇区的数量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;avgrq-sz 每秒I/O设备平均的请求次数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;avgqu-sz 每秒I/O设备的平均请求队列长度&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;await 每毫秒秒平均的请求等待和服务时间.包括请求到队列中,和I/O设备完成请求服务的时间&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;r _ await 毫秒级的读请求的等待和服务时间&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;w _ await 毫秒级的写请求的等待和服务时间&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;svctm 毫秒级的平均服务时间I(将要被移除,man文档的描述是不推荐的参考值)&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%util I/O操作占用CPU的百分率,当I/O操作过于繁忙的时候值会达到100%&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;至于网络的话就不写了.太多了&amp;gt;.&amp;lt;&lt;/p&gt;
+
+&lt;p&gt;命令行参数的使用:&lt;/p&gt;
+
+&lt;p&gt;* -c 仅打印CPU的report&lt;/p&gt;
+
+&lt;p&gt;* -d 打印I/O设备的report&lt;/p&gt;
+
+&lt;p&gt;* -h report输出格式化&lt;/p&gt;
+
+&lt;p&gt;* -k 输出的大小单位为kilobytes&lt;/p&gt;
+
+&lt;p&gt;* -m 输出的大小单位为megabytes&lt;/p&gt;
+
+&lt;p&gt;* -p 输出一个指定I/O设备的report,输出的结果中还包行这个设备下的所有分区表的分别的repor的统计信息 ex: iostat -dx -p sda 2 6 指定输出sda这个设备下的扩展的统计信息,每两秒输出一次,一共输出6次&lt;/p&gt;
+
+&lt;p&gt;* -t 指定report的统计的间隔时间(可忽略直接上数字)&lt;/p&gt;
+
+&lt;p&gt;* -V 打印iostat的版本号&lt;/p&gt;
+
+&lt;p&gt;* -x 显示扩展的统计项.默认的显示是从{tps-Blk_wrtn},而扩展项是从{rrqm/s-util} 用法iostat -x sda&lt;/p&gt;
+
+&lt;p&gt;参考书籍&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://book.douban.com/subject/4889838/'&gt;鸟哥的Linux私房菜.基础学习篇&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://book.douban.com/subject/1779429/'&gt;UNIX and Linux System Administration Handbook&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;</description>
+				<pubDate>Sat, 06 Jul 2013 19:07:50 +0800</pubDate>
+				<link>http://2375.me//2013/07/06/Linux-Performance-monitoring-practice.html</link>
+				<guid isPermaLink="true">http://2375.me//2013/07/06/Linux-Performance-monitoring-practice.html</guid>
+			</item>
+		
+	</channel>
+</rss>
