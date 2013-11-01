@@ -25,7 +25,7 @@
 &lt;p&gt;ClientCnxn是client端的核心实现,其中包含了两个轮寻的线程SendThread和EventThread,SendThread主要轮循从outgoingQueue队列中取得Zookeeper塞入的Packet包,通过ClientCnxnSocketNIO发送给服务器,并把发送的packet塞入pendingQueue队列中等待服务端的response,同时也从同服务端建立的管道中读取response把相应的packet移出pendingQueue,放入EventThrad负责处理的waitingEvents队列中,SendThread也负责和集群连接的建立、断开和session的ping连接,EventThread负责处理waitingEvent队列中packet,把packet中finished标识为true，使得阻塞的客户端函数返回并且取得packet中的response,根据不同的response调用不同的回调实现方法处理事件，其中waitingEvent队列采用LinkedBlockingQueue&lt;/p&gt;
 
 &lt;p&gt;ClientCnxnSocketNIO则是负责网络的通信，管道连接的建立，选择器的select操作,read和write的管道读写操作&lt;/p&gt;
-&lt;p&gt;&lt;iframe frameborder='0' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;' src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
+&lt;p&gt;&lt;iframe src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;' frameborder='0' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
 &lt;h3 id='id1'&gt;连接的建立&lt;/h3&gt;
 
 &lt;p&gt;参考org.apache.zookeeper.ZooKeeperMain中的main函数作为入口跟踪连接的建立&lt;/p&gt;
