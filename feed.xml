@@ -25,7 +25,7 @@
 &lt;p&gt;ClientCnxn是client端的核心实现,其中包含了两个轮寻的线程SendThread和EventThread,SendThread主要轮循从outgoingQueue队列中取得Zookeeper塞入的Packet包,通过ClientCnxnSocketNIO发送给服务器,并把发送的packet塞入pendingQueue队列中等待服务端的response,同时也从同服务端建立的管道中读取response把相应的packet移出pendingQueue,放入EventThrad负责处理的waitingEvents队列中,SendThread也负责和集群连接的建立、断开和session的ping连接,EventThread负责处理waitingEvent队列中packet,把packet中finished标识为true，使得阻塞的客户端函数返回并且取得packet中的response,根据不同的response调用不同的回调实现方法处理事件，其中waitingEvent队列采用LinkedBlockingQueue&lt;/p&gt;
 
 &lt;p&gt;ClientCnxnSocketNIO则是负责网络的通信，管道连接的建立，选择器的select操作,read和write的管道读写操作&lt;/p&gt;
-&lt;p&gt;&lt;iframe src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;' frameborder='0' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
+&lt;p&gt;&lt;iframe frameborder='0' src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' name='embed_dom' id='embed_dom' style='border:1px solid #000;display:block;width:510px; height:600px;'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
 &lt;h3 id='id1'&gt;连接的建立&lt;/h3&gt;
 
 &lt;p&gt;参考org.apache.zookeeper.ZooKeeperMain中的main函数作为入口跟踪连接的建立&lt;/p&gt;
@@ -753,7 +753,7 @@
 			</item>
 		
 			<item>
-				<title>Linux 性能监控实践[1]</title>
+				<title>Linux 常用性能监控解析</title>
 				<description>&lt;p&gt;搞Hadoop仅依靠ganglia或其他监控管理工具是远远不够的,真正了解熟悉各种mstat,nload,top等才靠谱,所以写篇linux的性能监控方面的文章搞清各个监控命令的细枝末节&lt;/p&gt;
 
 &lt;h3 id='_free'&gt;内存 free&lt;/h3&gt;
@@ -955,11 +955,255 @@
 
 &lt;p&gt;* -V 打印iostat的版本号&lt;/p&gt;
 
-&lt;p&gt;* -x 显示扩展的统计项.默认的显示是从{tps-Blk_wrtn},而扩展项是从{rrqm/s-util} 用法iostat -x sda&lt;/p&gt;
+&lt;p&gt;* -x 显示扩展的统计项.默认的显示是从{tps-Blk _ wrtn},而扩展项是从{rrqm/s-util} 用法iostat -x sda&lt;/p&gt;
 
-&lt;p&gt;参考书籍&lt;/p&gt;
+&lt;h3 id='io_iotop'&gt;I/O iotop&lt;/h3&gt;
+
+&lt;p&gt;iotop 较iostat能提供细粒度到线程或者进程的I/O资源使用情况，而且通过r,o,p,a等快捷键提供更好的数据展示方式&lt;/p&gt;
 
 &lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;-o 仅显示当前真实在做I/O操作的线程或者进程，方便的是可通过按键o热切换是显示线程还是进程&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-b 数据以非交互模式的形式展示，说白了就是一定的时间才刷数据，而不是有数据变动时才刷屏幕,当然正常的显示的变动也不是绝对意义上的变动&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-n 指定数据刷新的次数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-d 设定刷新的延迟时间&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-p 指定iotop需要监控的pid号，默认是所有的进程,可通过p切换需要监控进程PID,还是线程TID;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-u 指定iotop监控的用户&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-P 指定iotop监控的pid号，但是只是监控进程，一般的iotop是监控的所有的线程&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-a 指定iotop的显示监控数据是自iotop命令输入后累加起来的监控数据，而不是一般的benchmark数据 //可热切换的快捷键&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-k 展示数据的单位是kilobytes，一般的是Byte&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-t 在每行的显示数据前加时间&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-q 推出的快捷键&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;快捷键r用于reverse排序，可通过左右键选择排序列;其他快捷键o,p,a,q上边的命令提到了;&lt;/p&gt;
+
+&lt;h3 id='_nload'&gt;网络 nload&lt;/h3&gt;
+
+&lt;p&gt;nload 用于实时的显示网络流量状况的工具,显示的方式分为两部分，上部分为进入的流量，下部分为发出的流量&lt;/p&gt;
+
+&lt;p&gt;* -a 指定网络流量算入的时间ms,默认为300,那么我要指定为3秒为单位计算一次，就这样nload -a 3000&lt;/p&gt;
+
+&lt;p&gt;* -i nload命令滚动显示的数据图例的比例&lt;/p&gt;
+
+&lt;p&gt;* -t 指定数据刷新的时间间隔&lt;/p&gt;
+
+&lt;p&gt;* -m 把多个网络接口设备数据一起显示&lt;/p&gt;
+
+&lt;p&gt;* -u h|H|b|B|k|K|m|M|g|G 指定显示的单位 x(units)/s&lt;/p&gt;
+
+&lt;p&gt;* -U h|H|b|B|k|K|m|M|g|G 同上不过显示的总的数据量而不包含平均时间单位&lt;/p&gt;
+
+&lt;p&gt;* devices 指定需要监控的网络端口，例如我的本用的是无线连接网络,接口的名称为eth1,那么我就可以这样 nload devices eth1&lt;/p&gt;
+
+&lt;h3 id='system_top'&gt;system top&lt;/h3&gt;
+
+&lt;p&gt;top 实时的显示系统当前各个任务整体运行情况,是一个较为常用的命令&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;-c 交互式的命令快捷键，显示程序的完整启动命令&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-d 指定显示数据的刷新时间,单位为秒&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-H 交互的命令是否开启所有线程的总量的监控&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-i 交互的命令是否显示idle线程和僵尸线程&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-n 交互的命令指定页显示数据的量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-u 指定监控用户的UID&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-U 指定监控用户的UID或者username&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;-p 指定监控进程的pid号&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;top的常用输出解释:&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;PID 唯一的进程ID号&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;USER 任务的拥有者&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;PR 任务的优先级别&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;NI 负数意味着任务拥有更好的优先级&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;VIRT 任务所使用的虚拟内存的总量,包含所有换进换出的内存&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;RES 任务所使用的物理内存的总量,不包含swap的&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;S 任务的状态 &amp;#8216;D&amp;#8217; = 不能被中断的睡眠状态;&amp;#8217;R&amp;#8217;运行状态;&amp;#8217;S&amp;#8217;睡眠状态&amp;#8217;T&amp;#8217;被追踪的或者停止的状态;&amp;#8217;Z&amp;#8217;僵尸&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%CPU cpu的利用率&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;%MEM 物理内存的占用率&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;TIME+ 自任务启用起所使用的cpu片段时间总和&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id='system_vmstat'&gt;system vmstat&lt;/h3&gt;
+
+&lt;p&gt;vmstat 也是常用的监控内存,IO和CPU的工具&lt;/p&gt;
+
+&lt;p&gt;-a 显示内存是否活跃的内存占用量&lt;/p&gt;
+
+&lt;p&gt;-f 显示开机后启动的fork数量&lt;/p&gt;
+
+&lt;p&gt;-m 显示slabinfo的信息&lt;/p&gt;
+
+&lt;p&gt;-n 周期的显示数据&lt;/p&gt;
+
+&lt;p&gt;-s 显示内存的所有统计数据&lt;/p&gt;
+
+&lt;p&gt;-d 显示硬盘的统计数据&lt;/p&gt;
+
+&lt;p&gt;-D 以和-s类似的方式显示硬盘的总和的统计数据&lt;/p&gt;
+
+&lt;p&gt;-p 指定硬盘的分区显示磁盘的读写情况&lt;/p&gt;
+
+&lt;p&gt;-S 指定单位是k,K,m,M&lt;/p&gt;
+
+&lt;p&gt;vmstat 的输出解释:&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;r 等待运行的线程数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;b 多少个线程是处在不可中断的休眠中&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;swpd 虚拟内存的使用量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;free和buffer和cache就不解释了&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;si 从磁盘swapin的内存量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;so swapout到磁盘的内存量&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;bi 从磁盘设备收到的块数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;bo 发送到磁盘设备的块数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;in 每秒钟系统的中断数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;cs 每秒中系统的上下文环境切换的数&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;us cpu时间片花费在非内核代码上的比例,即用户占用的cpu时间片&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;sy 内核占用的cpu时间片&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;id cpu时间片的空闲比例&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;wa cpu时间片花费在等待I/O的比例&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;st cpu时间片用在等待被虚拟化调用上的比例&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;大致的命令就介绍这些,监控的命令还有些很好用的htop和lsof,netstat,还有专门用于内存数据分析的memdump等&lt;/p&gt;
+
+&lt;p&gt;相关链接&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://www.binospace.com/index.php/system-performance-analysis-practices/'&gt;系统性能分析的实践方法&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
 &lt;li&gt;
 &lt;p&gt;&lt;a href='http://book.douban.com/subject/4889838/'&gt;鸟哥的Linux私房菜.基础学习篇&lt;/a&gt;&lt;/p&gt;
 &lt;/li&gt;
