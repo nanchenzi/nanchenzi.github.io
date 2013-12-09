@@ -105,7 +105,7 @@
 &lt;p&gt;zk默认采用的选举类型(electionType)为FastLeaderElection&lt;/p&gt;
 
 &lt;p&gt;fastLeader的实现代码主要由FastLeaderElection和QuorumCnxManager两个类实现&lt;/p&gt;
-&lt;p&gt;&lt;iframe src='http://www.processon.com/embed/52a15fd80cf219c22501cde5' style='border:1px solid #000;display:block;width:720px; height:540px;' frameborder='0' id='embed_dom' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
+&lt;p&gt;&lt;iframe id='embed_dom' name='embed_dom' src='http://www.processon.com/embed/52a15fd80cf219c22501cde5' frameborder='0' style='border:1px solid #000;display:block;width:720px; height:540px;'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
 &lt;ol&gt;
 &lt;li&gt;
 &lt;p&gt;启动QuorumCnxManager.Listener线程监听zk的选举端口，对于accept得到的sock，创建SendWorker和RecvWorker放入SenderWorkerMap中;zk集群选举过程中每台机器都会创建sock连接至其他peer，过程中两台peer之间存在两个管道互相连接至对方，例如A至B的sock，B至A的sock,两台peer之间的通信通过一个sock就足够进行互相之间的读写操作，所以listener在端口上监听到sock后，读取该sock的源sid，判定该sid和my.sid的大小，如果my.sid大，则关闭这个sock，本机重新发起到该sid的sock放入senderworkermap中,也就是zk选举过程peer的两两通信sock都由大的sid发起至小的sid;&lt;/p&gt;
@@ -126,7 +126,23 @@
 &lt;li&gt;
 &lt;p&gt;在recvset放入一条新vote后判定是否达到leader的条件;判断收到的vote集合中与peer自己提议的propose相同的vote数是否达到机器中的一半以上，未达到条件则继续continue取下一个Notification;当达到条件时，则要稍等finalizeWait的时间，取recvqueue剩下的数据，这样做的目的是可能存在某台更适合做leader机器延迟启动或者发送消息阻塞等情况导致该Notification再判定条件满足后到达，当判定该Notification比当前propsor更适合做leader时，把该Notification放回recvqueue，continue进行4过程的操作更改peer的提议leader;如果所有recvqueue取出的剩余的Notification没有更合适的提议，则根据提议的sid判定是否与本机的sid相同，当相同的时候则设置为leading，否则设置为FOLLOWING或者OBSERVING;&lt;/p&gt;
 &lt;/li&gt;
-&lt;/ol&gt;</description>
+&lt;/ol&gt;
+
+&lt;p&gt;相关链接&lt;/p&gt;
+
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;a href='https://cwiki.apache.org/confluence/display/ZOOKEEPER/Zab+vs.+Paxos'&gt;Zab vs.Paxos&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://en.wikipedia.org/wiki/Paxos_(computer_science)'&gt;wiki Paxos&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+
+&lt;li&gt;
+&lt;p&gt;&lt;a href='http://research.microsoft.com/en-us/um/people/lamport/pubs/paxos-simple.pdf'&gt;paxos-simple&lt;/a&gt;&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;</description>
 				<pubDate>Sun, 08 Dec 2013 15:31:16 +0800</pubDate>
 				<link>http://2375.me//2013/12/08/Zookeeper-Server-StartUp-Analysis.html</link>
 				<guid isPermaLink="true">http://2375.me//2013/12/08/Zookeeper-Server-StartUp-Analysis.html</guid>
@@ -151,7 +167,7 @@
 &lt;p&gt;ClientCnxn是client端的核心实现,其中包含了两个轮寻的线程SendThread和EventThread,SendThread主要轮循从outgoingQueue队列中取得Zookeeper塞入的Packet包,通过ClientCnxnSocketNIO发送给服务器,并把发送的packet塞入pendingQueue队列中等待服务端的response,同时也从同服务端建立的管道中读取response把相应的packet移出pendingQueue,放入EventThrad负责处理的waitingEvents队列中,SendThread也负责和集群连接的建立、断开和session的ping连接,EventThread负责处理waitingEvent队列中packet,把packet中finished标识为true，使得阻塞的客户端函数返回并且取得packet中的response,根据不同的response调用不同的回调实现方法处理事件，其中waitingEvent队列采用LinkedBlockingQueue&lt;/p&gt;
 
 &lt;p&gt;ClientCnxnSocketNIO则是负责网络的通信，管道连接的建立，选择器的select操作,read和write的管道读写操作&lt;/p&gt;
-&lt;p&gt;&lt;iframe src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' style='border:1px solid #000;display:block;width:510px; height:600px;' frameborder='0' id='embed_dom' name='embed_dom'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
+&lt;p&gt;&lt;iframe id='embed_dom' name='embed_dom' src='http://www.processon.com/embed/5271f9130cf22f64f63475b2' frameborder='0' style='border:1px solid #000;display:block;width:510px; height:600px;'&gt;&amp;nbsp;&lt;/iframe&gt;&lt;/p&gt;
 &lt;h3 id='id1'&gt;连接的建立&lt;/h3&gt;
 
 &lt;p&gt;参考org.apache.zookeeper.ZooKeeperMain中的main函数作为入口跟踪连接的建立&lt;/p&gt;
