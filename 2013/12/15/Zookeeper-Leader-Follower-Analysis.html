@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+        <title>Blogging Like a Hacker</title>
+        <meta name="viewport" content="width=device-width">
+
+        <!-- syntax highlighting CSS -->
+        <link rel="stylesheet" href="/css/syntax.css">
+
+        <!-- Custom CSS -->
+        <link rel="stylesheet" href="/css/main.css">
+
+    </head>
+    <body>
+
+        <div class="container">
+          <div class="site">
+            <div class="header">
+              <h1 class="title"><a href="/">南臣子</a></h1>
+            </div>
+
+                <h2>Blogging Like a Hacker</h2>
+<p class="meta">15 Dec 2013</p>
+
+<div class="post">
+<p>zk在选举完成后依据配置文件zoo.cfg中的peerType[observer|participant],决定peer是observer还是participant,接着在多个participants中根据选举的结果决定peer是leader还是follower，每个peer在确定自身的角色后则调用不同的类方法实现各自的逻辑以起到在zk集群中的作用,概况的说不同的角色各自启用对应的zk子类实例,leader首先和各个follower同步当前数据，接着接收提议，当提议收到半数的确认后则提交通过该提议;</p>
+
+<h3 id='leader'>leader角色</h3>
+
+<p>初始化LeaderZooKeeperServer实例和leader实例;调用leader.lead()进入主函数;</p>
+
+<p>1)启动LearnerCnxAcceptor线程，监听zk集群的服务间通信端口，对于每个follower的accept连接分别创建LearnerHandler线程进行通信,每个LearnerHandler线程先读取follower端发来的连接请求QuorumPacket,接着通过该packet得到follower端的AcceptedEpoch,接着等待连接的follower达到半数以上返回连接中最大的AcceptedEpoch+1做为newEpoch;向连接的follower发送当前的newEpoch包，等待客户端返回ack确认包,该packet中还包含follower处理的lastLoggedZxid,等待initLimit*tickTime的时间即半数的follower发回ackPacket;</p>
+
+<p>2)通过lastLoggedZxid同步数据;当leader从data目录中load数据时，记录了当前snap之后处理的log,包含log的最大id和最小id,当follower端处理的lastLoggedZxid介于二者之间时，则发送所有大于lastLoggedZxid的Proposal给客户端，若lastLoggedZxid虽处在二者之间，但是leader端不存在该lastLoggedZxid,说明follower存在leader端不存在的log,则通过发送prevProposalZxid和Leader.TRUNC的packet通知客户端删除prevProposalZxid之后的log;若未发送diff或者trunc的消息，则leader发送snap消息并且包含leader的整个zkDB给follower，当同步完成leader修改socket的timeout为tickTime*syncLimit,发送UPTODATE给各个follower标志着集群可以开始对客户端提供服务了，</p>
+
+<p>3)前一篇介绍zk集群启动时,启动了NIOServerCnxnFactory用于监听client端口,服务于客户端的请求.对于所有的客户端请求终会调用ZookeeperServer的processPacket方法提交Request给zk中特定firstProcessor进行相应的处理，那就来看看继承子类LeaderZooKeeperServer中的处理逻辑,firstProcessor对应的实现类为PrepRequestProcessor,该实现类对于所有提交的Request都放入submittedRequests阻塞队列中，线程轮循的从队列中take出数据进行处理，对于操作的类型做针对性的操作,例如create或者delete类型封装成ChangeRecord加入zk实例的outstandingChanges和outstandingChangesForPath两个集合中，用于标识处理中的节点;紧接着firstProcessor就把Request交给ProposalRequestProcessor，该实现类把Request封装为QuorumPacket，分别添加到各个follower对应的LearnerHandler的queuedPackets集合中发送给各个follower,同时ProposalRequestProcessor还把Request和QuoqueuedPackets封装为Proposal添加入outstandingProposals集合中等待后续收到客户端的ack后做相应处理;在构造ProposalRequestProcessor实例的同时,也初始化了SyncRequestProcessor和AckRequestProcessor两个线程,ProposalRequestProcessor处理的每个Request也都同时提交给了SyncRequestProcessor做处理，SyncRequestProcessor把Request写入日志，同时定量提交给AckRequestProcessor处理,即调用leader的processAck方法，确认此Packet的ack达到半数以上后就把此packet的zxid以leader.COMMIT的类型发送给所有的follower和Observer;以及将Request放入CommitProcessor的集合committedRequests中;ProposalRequestProcessor中同时也存在nextProcessor(好多个nextProcessor啊!&#8230;)CommitProcessor，该Processor接收ProposalRequestProcessor传递的Request放入等待集合中,等待该Request得到通过确认commit的时候,交给下一个Processor也是最后一个FinalRequestProcessor做处理，调用zk的processTxn处理该Request的请求，接着生成response通过NIOServerCnxn线程返回给客户端.</p>
+<iframe name='embed_dom' style='border:1px solid #000;display:block;width:830px; height:380px;' src='http://www.processon.com/embed/52b19d760cf232c3edf207b8' id='embed_dom' frameborder='0'>&nbsp;</iframe>
+<p>4)在集群正常的运行状态中，LearnerHandler线程轮寻的处理从follower端发来的packet，根据packet的类型做对应的逻辑处理.例如ACK，REQUEST,Ping等,对于Follower发来的Request,是封装为自身提交的Request交给firstProcessor做处理</p>
+
+<p>5)同时lead主函数中learners集合维护所有follower对应的LearnerCnxAcceptor,在tickTime/2的时间间隔内分别向各个follower发送PING包，维护leader和follower间的心跳.</p>
+
+<h3 id='follower'>follower角色</h3>
+
+<p>1)connectToLeader()建立至Leader的连接,通过该连接端口registerWithLeader(Leader.FOLLOWERINFO)向leader注册follower,向服务端发送QuorumPacket实例，包含客户端的版本号，连接的角色类型，当前的AcceptedEpoch，和该follower的sid;接着读取leader发回的LEADERINFO包，设置当前的AcceptedEpoch为服务端发回的newEpoch,并且向leader发送ACKEPOCH包，还包含了当前follower的lastLoggedZxid；</p>
+
+<p>2)接收来自服务端的同步数据,若为snap,则清空zkDB,并且从输入流中反序列化数据至zkDB中;若为TRUNC,则删除日志中大于leader返回的prevProposalZxid的文件，并重新loadDataBase()</p>
+</div>
+
+    <div id="disqus_thread"></div>
+    <script type="text/javascript">
+        /* * * CONFIGURATION VARIABLES: EDIT BEFORE PASTING INTO YOUR WEBPAGE * * */
+        var disqus_shortname = '2375'; // required: replace example with your forum shortname
+
+        /* * * DON'T EDIT BELOW THIS LINE * * */
+        (function() {
+            var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+            dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+            (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+        })();
+    </script>
+    <noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+    <a href="http://disqus.com" class="dsq-brlink">comments powered by <span class="logo-disqus">Disqus</span></a>
+
+
+            <div class="footer">
+              <div class="contact">
+                <p>
+                  Lin Yong<br />
+                  My Douban<br />
+                  fantasylinyong@gmail.com<br />
+                </p>
+              </div>
+              <div class="contact">
+                <p>
+                  <a href="http://github.com/nanchenzi/" target="_blank">github.com/nanchenzi</a><br />
+                  <a href="http://www.douban.com/people/kiss2375/" target="_blank">douban.com/people/kiss2375</a><br />
+                  <a href="http://instagram.com/kiss2375/" target="_blank">instagram.com/kiss2375</a><br />
+                </p>
+              </div>
+	      <div class="contact">
+	        <p>
+		   <a href="http://2375.me/feed.xml" target="_blank">RSS</a><br />
+                </p>
+              </div>
+            </div>
+          </div>
+        </div> <!-- /container -->
+
+    </body>
+</html>
